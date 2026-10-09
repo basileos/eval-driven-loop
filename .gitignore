@@ -1,0 +1,21 @@
+.DS_Store
+.idea
+
+__pycache__
+*.py[cod]
+.venv/
+
+# Railway datasets and source imagery are stored outside Git.
+/railways/val_dataset/
+/railways/ood_dataset/
+/railways/images/
+
+# Generated experiments, frame results, and video exports.
+/railways/runs/
+/railways/*results*/
+/railways/*.results.json
+/railways/candidate_diagnostics.jpg
+/railways/*.[mM][pP]4
+/railways/*.[mM][oO][vV]
+/railways/*.[aA][vV][iI]
+/railways/*.[mM][kK][vV]
