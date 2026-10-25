@@ -1,53 +1,72 @@
+import time
 import cv2
 import numpy as np
 
 
 def process_image(img_path: str) -> list[dict[str, object]]:
-    return process_frame(cv2.imread(img_path, cv2.IMREAD_COLOR))
+    started = time.perf_counter()
+    timings = dict.fromkeys(
+        ("decode", "preprocess", "lsd", "proposal_generation",
+         "profile_fitting", "verification", "tracing", "total"), 0.0
+    )
+    process_image.last_timings = timings
+    try:
+        t = time.perf_counter()
+        src = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        timings["decode"] = time.perf_counter() - t
+        if src is None or src.size == 0:
+            return []
+        return _process_frame(src, timings)
+    finally:
+        timings["total"] = time.perf_counter() - started
+        process_image.last_timings = dict(timings)
 
 
-def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, object]]:
-    """Same detector on a decoded native-resolution BGR frame."""
-    if src is None or src.size == 0:
-        return []
+def _process_frame(src, timings):
     h, w = src.shape[:2]
     if min(h, w) < 32:
         return []
-    # ROI pixels retain their scale; do not shrink gauge/length limits to the crop.
-    reference_h, reference_w = reference_shape if reference_shape is not None else (h, w)
-    diagonal = float(np.hypot(reference_w, reference_h))
+    diagonal = float(np.hypot(w, h))
     minimum_length = diagonal * 0.05
     max_gauge = min(180.0, diagonal * 0.045)
+    t = time.perf_counter()
     gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
     b, g, r = [c.astype(np.int16) for c in cv2.split(src)]
     vegetation = ((g - r > 9) & (g - b > 5) & (g > r * 1.08)).astype(np.uint8)
-    del src, b, g, r
-
-    # LSD runs at native resolution; cap clutter before matching.
+    scale = min(1.0, 1280.0 / w, 720.0 / h)
+    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
+    small = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    timings["preprocess"] += time.perf_counter() - t
+    t = time.perf_counter()
     detector = cv2.createLineSegmentDetector(
         cv2.LSD_REFINE_STD, 1.0, 0.6, 2.0, 22.5, 0.0, 0.7, 1024
     )
-    raw = detector.detect(gray)[0]
+    raw = detector.detect(small)[0]
+    timings["lsd"] += time.perf_counter() - t
     if raw is None:
         return []
-    lines = np.asarray(raw, np.float32).reshape(-1, 4)
+    t = time.perf_counter()
+    lines = np.asarray(raw, np.float32).reshape(-1, 4).copy()
+    lines *= np.array([w / sw, h / sh, w / sw, h / sh], np.float32)
     p, q = lines[:, :2], lines[:, 2:]
     lengths = np.linalg.norm(q - p, axis=1)
     mids = (p + q) * 0.5
-    ids = np.flatnonzero(lengths >= max(10.0, diagonal * 0.0023))
+    ids = np.flatnonzero(lengths >= max(12.0, diagonal * 0.0023))
     ids = ids[np.argsort(-lengths[ids], kind="stable")]
     selected, cells = [], {}
+    cell_size = max(96.0, diagonal * 0.032)
     for idx in ids:
-        key = tuple((mids[idx] // 144).astype(int))
-        if cells.get(key, 0) >= 24:
+        key = tuple((mids[idx] // cell_size).astype(int))
+        if cells.get(key, 0) >= 16:
             continue
         selected.append(int(idx))
         cells[key] = cells.get(key, 0) + 1
-        if len(selected) >= 3800:
+        if len(selected) >= 2200:
             break
     ids = np.asarray(selected, int)
     p, q, lengths, mids = p[ids], q[ids], lengths[ids], mids[ids]
-    if len(p) < 2:
+    if len(p) == 0:
+        timings["proposal_generation"] += time.perf_counter() - t
         return []
     directions = (q - p) / lengths[:, None]
     flip = (directions[:, 0] < 0) | (
@@ -55,56 +74,11 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
     )
     directions[flip] *= -1
 
-    def normal_of(axis):
-        return np.array([-axis[1], axis[0]], np.float32)
-
-    proposals = []
-    for i in range(len(p) - 1):
-        u = directions[i]
-        n = normal_of(u)
-        js = np.arange(i + 1, len(p))
-        offsets = mids[js] - mids[i]
-        widths = np.abs(offsets @ n)
-        good = (
-            (np.abs(directions[js] @ u) > 0.994)
-            & (widths >= 3.5) & (widths <= max_gauge)
-            & (np.abs(offsets @ u) < (lengths[i] + lengths[js]) * 0.5)
-        )
-        js = js[good]
-        if not len(js):
-            continue
-        a0, a1 = sorted((float(p[i] @ u), float(q[i] @ u)))
-        lo = np.maximum(a0, np.minimum(p[js] @ u, q[js] @ u))
-        hi = np.minimum(a1, np.maximum(p[js] @ u, q[js] @ u))
-        overlap = hi - lo
-        gauge = np.abs((mids[js] - mids[i]) @ n)
-        error = np.abs(directions[js] @ n)
-        positions = np.flatnonzero(
-            (overlap >= np.maximum(17.0, gauge * 1.35))
-            & (error * overlap <= np.maximum(2.5, gauge * 0.3))
-        )
-        rank = overlap[positions] / (1 + 10 * error[positions])
-        positions = positions[np.argsort(-rank, kind="stable")[:6]]
-        for k in positions:
-            j = js[k]
-            v = directions[j].copy()
-            if v @ u < 0:
-                v = -v
-            axis = u + v
-            axis /= np.linalg.norm(axis)
-            t = float((lo[k] + hi[k]) * 0.5)
-            ca = mids[i] + u * (t - float(mids[i] @ u))
-            cb = mids[j] + v * ((t - float(mids[j] @ u)) / float(v @ u))
-            proposals.append((
-                float(overlap[k]) / (1 + 10 * float(error[k])),
-                (ca + cb) * 0.5, axis,
-                abs(float((cb - ca) @ normal_of(axis))),
-            ))
-    proposals.sort(key=lambda item: -item[0])
-    gray = gray.astype(np.float32)
-
     def unit(v):
         return v / max(1e-6, float(np.linalg.norm(v)))
+
+    def normal_of(u):
+        return np.array([-u[1], u[0]], np.float32)
 
     def rotate(u, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -112,6 +86,65 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
 
     def inside(point):
         return 0 <= point[0] <= w - 1 and 0 <= point[1] <= h - 1
+
+    # Index complete native-coordinate segments, including long overlaps.
+    index_size = max(96.0, max_gauge * 1.5)
+    spatial = {}
+    for i in range(len(p)):
+        lo = np.floor(np.minimum(p[i], q[i]) / index_size).astype(int)
+        hi = np.floor(np.maximum(p[i], q[i]) / index_size).astype(int)
+        for cy in range(lo[1], hi[1] + 1):
+            for cx in range(lo[0], hi[0] + 1):
+                spatial.setdefault((cx, cy), []).append(i)
+    proposals = []
+    for i in range(len(p)):
+        lo = np.floor((np.minimum(p[i], q[i]) - max_gauge) / index_size).astype(int)
+        hi = np.floor((np.maximum(p[i], q[i]) + max_gauge) / index_size).astype(int)
+        neighbors = set()
+        for cy in range(lo[1], hi[1] + 1):
+            for cx in range(lo[0], hi[0] + 1):
+                neighbors.update(spatial.get((cx, cy), ()))
+        js = np.asarray(sorted(j for j in neighbors if j > i), int)
+        if not len(js):
+            continue
+        u, n = directions[i], normal_of(directions[i])
+        offsets = mids[js] - mids[i]
+        widths = np.abs(offsets @ n)
+        good = (
+            (np.abs(directions[js] @ u) > 0.992)
+            & (widths >= 3.5) & (widths <= max_gauge)
+            & (np.abs(offsets @ u) < (lengths[i] + lengths[js]) * 0.5)
+        )
+        js = js[good]
+        if not len(js):
+            continue
+        a0, a1 = sorted((float(p[i] @ u), float(q[i] @ u)))
+        lo_t = np.maximum(a0, np.minimum(p[js] @ u, q[js] @ u))
+        hi_t = np.minimum(a1, np.maximum(p[js] @ u, q[js] @ u))
+        overlap = hi_t - lo_t
+        gauge = np.abs((mids[js] - mids[i]) @ n)
+        error = np.abs(directions[js] @ n)
+        positions = np.flatnonzero(
+            (overlap >= np.maximum(17.0, gauge * 1.25))
+            & (error * overlap <= np.maximum(3.0, gauge * 0.30))
+        )
+        rank = overlap[positions] / (1 + 10 * error[positions])
+        positions = positions[np.argsort(-rank, kind="stable")[:5]]
+        for k in positions:
+            j = js[k]
+            v = directions[j].copy()
+            if v @ u < 0:
+                v = -v
+            axis = unit(u + v)
+            along = float((lo_t[k] + hi_t[k]) * 0.5)
+            ca = mids[i] + u * (along - float(mids[i] @ u))
+            cb = mids[j] + v * ((along - float(mids[j] @ u)) / float(v @ u))
+            proposals.append((
+                float(overlap[k]) / (1 + 10 * float(error[k])),
+                (ca + cb) * 0.5, axis, abs(float((cb - ca) @ normal_of(axis)))
+            ))
+    proposals.sort(key=lambda item: -item[0])
+    timings["proposal_generation"] += time.perf_counter() - t
 
     def correlation(a, b):
         if len(a) < 8:
@@ -127,31 +160,33 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
 
     def valid_rows(mx, my, core):
         return (
-            (mx[:, core] >= 0).all(axis=1)
-            & (mx[:, core] <= w - 1).all(axis=1)
-            & (my[:, core] >= 0).all(axis=1)
-            & (my[:, core] <= h - 1).all(axis=1)
+            (mx[:, core] >= 0).all(axis=1) & (mx[:, core] <= w - 1).all(axis=1)
+            & (my[:, core] >= 0).all(axis=1) & (my[:, core] <= h - 1).all(axis=1)
         )
 
-    def sample(center, axis, gauge, extent, outer=1.4, color=False):
-        normal = normal_of(axis)
-        half = int(extent // 2)
-        t = np.arange(-half, half + 1, dtype=np.float32)
-        radius = int(np.ceil(gauge * outer)) + 3
-        z = np.arange(-radius, radius + 1, dtype=np.float32)
-        mx = (center[0] + t[:, None] * axis[0] + z[None, :] * normal[0]).astype(np.float32)
-        my = (center[1] + t[:, None] * axis[1] + z[None, :] * normal[1]).astype(np.float32)
+    def remap_patch(mx, my, z, gauge, color):
+        mx, my = mx.astype(np.float32), my.astype(np.float32)
         valid = valid_rows(mx, my, np.abs(z) <= gauge * 0.65)
         patch = cv2.remap(
             gray, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-        )[valid]
+        )[valid].astype(np.float32)
         green = None
         if color:
             green = cv2.remap(
                 vegetation, mx, my, cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0
             )[valid]
         return patch, z, green
+
+    def sample(center, axis, gauge, extent, outer=1.4, color=False):
+        normal = normal_of(axis)
+        half = int(extent // 2)
+        ts = np.arange(-half, half + 1, dtype=np.float32)
+        radius = int(np.ceil(gauge * outer)) + 3
+        z = np.arange(-radius, radius + 1, dtype=np.float32)
+        mx = center[0] + ts[:, None] * axis[0] + z[None, :] * normal[0]
+        my = center[1] + ts[:, None] * axis[1] + z[None, :] * normal[1]
+        return remap_patch(mx, my, z, gauge, color)
 
     def rail_profile(patch, gauge):
         profile = patch.mean(axis=0)
@@ -160,13 +195,54 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         ).ravel()
         return np.abs(profile - smooth)
 
+    def subpixel(ridge, k):
+        if k <= 0 or k >= len(ridge) - 1:
+            return float(k)
+        a, b, c = float(ridge[k - 1]), float(ridge[k]), float(ridge[k + 1])
+        denominator = a - 2 * b + c
+        if denominator >= -1e-5:
+            return float(k)
+        return float(k) + float(np.clip(0.5 * (a - c) / denominator, -0.5, 0.5))
+
+    def fit_section(center, axis, gauge, extent, search_scale=1.0):
+        started = time.perf_counter()
+        try:
+            patch, z, _ = sample(center, axis, gauge, extent, 0.95)
+            if len(patch) < max(12, extent * 0.45):
+                return None
+            ridge = rail_profile(patch, gauge)
+            radius = max(2.0, min(16.0, gauge * 0.22)) * search_scale
+            ia = np.flatnonzero(np.abs(z + gauge * 0.5) <= radius)
+            ib = np.flatnonzero(np.abs(z - gauge * 0.5) <= radius)
+            if not len(ia) or not len(ib):
+                return None
+            widths = z[ib][None, :] - z[ia][:, None]
+            shift = (z[ib][None, :] + z[ia][:, None]) * 0.5
+            scores = (
+                ridge[ia, None] + ridge[ib][None, :]
+                - 1.5 * ((widths - gauge) / max(2.0, gauge * 0.15)) ** 2
+                - 0.6 * (shift / max(2.0, gauge * 0.15)) ** 2
+            )
+            scores[(widths < gauge * 0.76) | (widths > gauge * 1.24)] = -1e6
+            a, b = np.unravel_index(np.argmax(scores), scores.shape)
+            a, b = int(ia[a]), int(ib[b])
+            strength = min(float(ridge[a]), float(ridge[b]))
+            if strength < 1.25:
+                return None
+            za = float(z[0]) + subpixel(ridge, a)
+            zb = float(z[0]) + subpixel(ridge, b)
+            if not max(3.5, gauge * 0.72) <= zb - za <= min(max_gauge, gauge * 1.28):
+                return None
+            point = center + normal_of(axis) * ((za + zb) * 0.5)
+            return point, float(zb - za), strength
+        finally:
+            timings["profile_fitting"] += time.perf_counter() - started
+
     def rail_morphology(patch, z, gauge):
-        # Require narrow, persistent ridges with both flanks, not road edges.
         if len(patch) < 24:
             return False
         longitudinal = cv2.GaussianBlur(
-            patch, (1, 0), sigmaX=0,
-            sigmaY=max(1.0, min(3.0, gauge * 0.10)),
+            patch, (1, 0), sigmaX=0, sigmaY=max(1.0, min(3.0, gauge * 0.10))
         )
         profile = longitudinal.mean(axis=0)
         flank = max(2, min(7, int(round(gauge * 0.065))))
@@ -175,10 +251,8 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
             indices = np.flatnonzero(
                 np.abs(z - side * gauge * 0.5) <= max(2.0, gauge * 0.13)
             )
-            indices = indices[
-                (indices >= flank + 1) & (indices < len(z) - flank - 1)
-            ]
-            best = None
+            indices = indices[(indices >= flank + 1) & (indices < len(z) - flank - 1)]
+            best = 0.0
             for k in indices:
                 for polarity in (-1.0, 1.0):
                     a = polarity * (longitudinal[:, k] - longitudinal[:, k - flank])
@@ -188,10 +262,8 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                     if contrast < 0.85:
                         continue
                     balance = contrast / max(ma, mb, 1e-6)
-                    if balance < 0.19:
-                        continue
                     persistent = float(np.mean((a > 0.3) & (b > 0.3)))
-                    if persistent < 0.32:
+                    if balance < 0.19 or persistent < 0.32:
                         continue
                     blocks = np.array_split(np.minimum(a, b), 3)
                     if sum(float(x.mean()) > 0.2 for x in blocks) < 2:
@@ -202,39 +274,11 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                     )
                     if inner < max(0.35, contrast * 0.12):
                         continue
-                    score = contrast * persistent * np.sqrt(balance)
-                    if best is None or score > best:
-                        best = score
-            if best is None:
+                    best = max(best, contrast * persistent * np.sqrt(balance))
+            if best < 0.30:
                 return False
             results.append(best)
-        return min(results) >= 0.30
-
-    def fit_section(center, axis, gauge, extent, search_scale=1.0):
-        patch, z, _ = sample(center, axis, gauge, extent, 0.95)
-        if len(patch) < max(12, extent * 0.45):
-            return None
-        ridge = rail_profile(patch, gauge)
-        radius = max(2.0, min(16.0, gauge * 0.22)) * search_scale
-        ia = np.flatnonzero(np.abs(z + gauge * 0.5) <= radius)
-        ib = np.flatnonzero(np.abs(z - gauge * 0.5) <= radius)
-        if not len(ia) or not len(ib):
-            return None
-        widths = z[ib][None, :] - z[ia][:, None]
-        shift = (z[ib][None, :] + z[ia][:, None]) * 0.5
-        scores = (
-            ridge[ia, None] + ridge[ib][None, :]
-            - 1.5 * ((widths - gauge) / max(2.0, gauge * 0.15)) ** 2
-            - 0.6 * (shift / max(2.0, gauge * 0.15)) ** 2
-        )
-        scores[(widths < gauge * 0.76) | (widths > gauge * 1.24)] = -1e6
-        a, b = np.unravel_index(np.argmax(scores), scores.shape)
-        a, b = ia[a], ib[b]
-        strength = min(float(ridge[a]), float(ridge[b]))
-        if strength < 1.25:
-            return None
-        point = center + normal_of(axis) * float((z[a] + z[b]) * 0.5)
-        return point, float(z[b] - z[a]), strength
+        return len(results) == 2
 
     def sleeper_structure(patch, z, green, gauge, shifts, period):
         count = len(patch)
@@ -255,7 +299,7 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         )
         aligned_green = cv2.remap(
             green.astype(np.float32), mx, my, cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=1,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=1
         )
         residual = aligned - cv2.GaussianBlur(
             aligned, (1, 0), sigmaX=0, sigmaY=max(1.2, period * 0.45)
@@ -272,15 +316,10 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         ore = (z >= gauge * 0.88) & (z <= gauge * 1.35)
         if not ol.any() or not ore.any():
             return False
-        # Reject crop texture continuing outside the rails after skew correction.
         for mask in (ol, ore):
             outer = residual[:, mask].mean(axis=1)
-            if (
-                correlation(signal, outer) > 0.72
-                and float(np.std(outer)) > amplitude * 0.80
-            ):
+            if correlation(signal, outer) > 0.72 and np.std(outer) > amplitude * 0.80:
                 return False
-        best = 0
         for polarity in (-1.0, 1.0):
             s = smooth * polarity
             peaks = np.flatnonzero(
@@ -314,8 +353,9 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                 continue
             if valid[-1] - valid[0] < max(gauge * 1.25, period * 3):
                 continue
-            best = max(best, len(valid))
-        return best >= 4 and rail_morphology(aligned, z, gauge)
+            if rail_morphology(aligned, z, gauge):
+                return True
+        return False
 
     def stationary_evidence(patch, z, green, gauge, strict):
         if len(patch) < max(35, gauge * 1.6):
@@ -327,7 +367,7 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         groups = [
             (z >= -0.36 * gauge) & (z <= -0.13 * gauge),
             np.abs(z) <= max(0.6, 0.10 * gauge),
-            (z >= 0.13 * gauge) & (z <= 0.36 * gauge),
+            (z >= 0.13 * gauge) & (z <= 0.36 * gauge)
         ]
         if any(not group.any() for group in groups):
             return 0.0
@@ -339,19 +379,19 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         if limit < 1:
             return 0.0
         target = signals[1][limit:-limit]
-        shift_values = np.arange(-limit, limit + 1)
+        shifts_available = np.arange(-limit, limit + 1)
         correlations = []
         for signal in (signals[0], signals[2]):
             correlations.append(np.array([
                 correlation(target, signal[limit + shift:len(signal) - limit + shift])
-                for shift in shift_values
+                for shift in shifts_available
             ]))
         joint = np.minimum(correlations[0], correlations[1][::-1])
-        best_shift = int(np.argmax(joint))
-        shifts = [int(shift_values[best_shift]), -int(shift_values[best_shift])]
-        coherence = float(joint[best_shift])
+        k = int(np.argmax(joint))
+        shifts = [int(shifts_available[k]), -int(shifts_available[k])]
+        coherence = float(joint[k])
         independent = [int(np.argmax(c)) for c in correlations]
-        independent_shifts = [int(shift_values[k]) for k in independent]
+        independent_shifts = [int(shifts_available[k]) for k in independent]
         if abs(sum(independent_shifts)) <= max(3, limit * 0.35):
             quality = min(float(c[k]) for c, k in zip(correlations, independent))
             if quality > coherence:
@@ -377,10 +417,9 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         best = int(maxima[np.argmax(ac[maxima])])
         period, periodicity = int(lags[best]), float(ac[best])
         half = max(1, period // 2)
-        if (
-            periodicity < 0.20
-            or periodicity - correlation(signal[:-half], signal[half:]) < 0.16
-        ):
+        if periodicity < 0.20 or periodicity - correlation(
+            signal[:-half], signal[half:]
+        ) < 0.16:
             return 0.0
         ridge = rail_profile(patch, gauge)
         strengths = []
@@ -394,17 +433,12 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
             region = (side * z >= gauge * 0.86) & (side * z <= gauge * 1.30)
             if not region.any():
                 return 0.0
-            outer = highpass(
-                patch[:, region].mean(axis=1), max(2, gauge * 0.30)
-            )[limit:-limit]
+            outer = highpass(patch[:, region].mean(axis=1), max(2, gauge * 0.30))[limit:-limit]
             outside_correlations.append(abs(correlation(signal, outer)))
             outside_amplitudes.append(float(np.std(outer)))
         if min(outside_correlations) > 0.53:
             return 0.0
-        if (
-            max(outside_correlations) > 0.82
-            and min(outside_amplitudes) > amplitude * 0.75
-        ):
+        if max(outside_correlations) > 0.82 and min(outside_amplitudes) > amplitude * 0.75:
             return 0.0
         peaks = np.flatnonzero(
             (ridge[1:-1] > ridge[:-2]) & (ridge[1:-1] >= ridge[2:])
@@ -430,29 +464,56 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         starts = np.unique(np.linspace(0, count - window, 4).astype(int))
         valid = []
         for start in starts:
-            stop = start + window
             quality = stationary_evidence(
-                patch[start:stop], z, green[start:stop], gauge, True
+                patch[start:start + window], z, green[start:start + window], gauge, True
             )
             if quality >= 0.075:
                 valid.append((int(start), quality))
-        if len(valid) < 2:
-            return full
-        score = 0.0
         for i, (start, quality) in enumerate(valid):
             for other, other_quality in valid[i + 1:]:
                 if other - start >= max(24, window * 0.40):
-                    score = max(score, min(quality, other_quality))
-        return max(full, score)
+                    full = max(full, min(quality, other_quality))
+        return full
 
     def evidence(center, axis, gauge, extent, strict=False):
-        patch, z, green = sample(center, axis, gauge, extent, color=True)
-        return patch_evidence(patch, z, green, gauge, strict)
+        started = time.perf_counter()
+        try:
+            patch, z, green = sample(center, axis, gauge, extent, color=True)
+            return patch_evidence(patch, z, green, gauge, strict)
+        finally:
+            timings["verification"] += time.perf_counter() - started
 
     def extent_for(gauge):
-        return int(np.clip(gauge * 4.5, 72, 440))
+        return int(np.clip(gauge * 4.5, 80, 440))
 
-    rectification_left = [260]
+    def path_patch(path, widths):
+        arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+        keep = np.r_[True, np.diff(arc) > 0.05]
+        path, widths, arc = path[keep], widths[keep], arc[keep]
+        if len(path) < 3 or arc[-1] < 30:
+            return None
+        reference = float(np.max(widths))
+        normalized = np.r_[0.0, np.cumsum(
+            np.diff(arc) * reference / np.maximum((widths[1:] + widths[:-1]) * 0.5, 3.5)
+        )]
+        count = min(1000, int(np.ceil(normalized[-1])) + 1)
+        positions = np.linspace(0, normalized[-1], count)
+        path = np.column_stack([
+            np.interp(positions, normalized, path[:, k]) for k in range(2)
+        ]).astype(np.float32)
+        widths = np.interp(positions, normalized, widths)
+        tangent = np.gradient(path, axis=0)
+        tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-6)
+        normals = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+        radius = int(np.ceil(reference * 1.4)) + 3
+        z = np.arange(-radius, radius + 1, dtype=np.float32)
+        xy = path[:, None, :] + normals[:, None, :] * (
+            z[None, :, None] * (widths / reference)[:, None, None]
+        )
+        patch, z, green = remap_patch(xy[:, :, 0], xy[:, :, 1], z, reference, True)
+        return patch, z, green, reference
+
+    rectification_left = [180]
 
     def rectified_evidence(center, axis, gauge, extent):
         if rectification_left[0] <= 0:
@@ -472,10 +533,9 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                 )
                 if fit is None or not inside(fit[0]):
                     continue
-                point, width, strength = fit
-                score = strength - abs(angle) * 10
+                score = fit[2] - abs(angle) * 10
                 if best is None or score > best[0]:
-                    best = (score, point, width)
+                    best = (score, fit[0], fit[1])
             if best is not None:
                 valid_offsets.append(float(offset))
                 centers.append(best[1])
@@ -494,118 +554,106 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         fitted = np.polyval(coefficients, scaled)
         if np.percentile(np.abs(lateral - fitted), 80) > max(2.5, gauge * 0.09):
             return 0.0
-        width_coefficients = np.polyfit(scaled, widths, 1)
-        fitted_widths = np.polyval(width_coefficients, scaled)
-        if np.percentile(np.abs(widths - fitted_widths), 80) > max(2.5, gauge * 0.12):
+        wc = np.polyfit(scaled, widths, 1)
+        if np.percentile(np.abs(widths - np.polyval(wc, scaled)), 80) > max(2.5, gauge * 0.12):
             return 0.0
-        t = np.arange(x[0], x[-1] + 0.5, dtype=np.float32)
-        lateral = np.polyval(coefficients, t / extent)
-        path = center + t[:, None] * axis + lateral[:, None] * normal
-        local_width = np.polyval(width_coefficients, t / extent)
-        if np.any(local_width < gauge * 0.65) or np.any(local_width > gauge * 1.4):
+        ts = np.linspace(x[0], x[-1], max(9, int((x[-1] - x[0]) / 8) + 1))
+        path = center + ts[:, None] * axis + np.polyval(
+            coefficients, ts / extent
+        )[:, None] * normal
+        local_widths = np.polyval(wc, ts / extent)
+        if np.any(local_widths < gauge * 0.65) or np.any(local_widths > gauge * 1.4):
             return 0.0
-        arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
-        reference_width = float(np.max(local_width))
-        normalized_arc = np.r_[0.0, np.cumsum(
-            np.diff(arc) * reference_width / ((local_width[1:] + local_width[:-1]) * 0.5)
-        )]
-        count = int(np.ceil(normalized_arc[-1])) + 1
-        if count < 2:
-            return 0.0
-        positions = np.linspace(0, normalized_arc[-1], count)
-        path = np.column_stack([
-            np.interp(positions, normalized_arc, path[:, k]) for k in range(2)
-        ])
-        local_width = np.interp(positions, normalized_arc, local_width)
-        tangent = np.gradient(path, axis=0)
-        tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-6)
-        normals = np.column_stack((-tangent[:, 1], tangent[:, 0]))
-        radius = int(np.ceil(reference_width * 1.4)) + 3
-        z = np.arange(-radius, radius + 1, dtype=np.float32)
-        xy = path[:, None, :] + normals[:, None, :] * (
-            z[None, :, None] * (local_width / reference_width)[:, None, None]
-        )
-        mx, my = xy[:, :, 0].astype(np.float32), xy[:, :, 1].astype(np.float32)
-        valid = valid_rows(mx, my, np.abs(z) <= reference_width * 0.65)
-        patch = cv2.remap(
-            gray, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-        )[valid]
-        green = cv2.remap(
-            vegetation, mx, my, cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-        )[valid]
-        return patch_evidence(patch, z, green, reference_width, True)
+        started = time.perf_counter()
+        try:
+            result = path_patch(path.astype(np.float32), local_widths)
+            if result is None:
+                return 0.0
+            return patch_evidence(*result, True)
+        finally:
+            timings["verification"] += time.perf_counter() - started
 
-    # Opposite-ridge proposals retain rails split by vegetation.
-    single_proposals, single_cells = [], {}
+    # Recover both native rail ridges around coarse ballast or center lines.
+    t = time.perf_counter()
+    local_proposals, local_cells = [], {}
+    local_count = 0
     for i in range(len(p)):
-        if lengths[i] < max(28, diagonal * 0.006):
+        if lengths[i] < max(25.0, diagonal * 0.005):
             continue
-        key = tuple((mids[i] // 160).astype(int))
-        if single_cells.get(key, 0) >= 2:
+        key = tuple((mids[i] // cell_size).astype(int))
+        if local_cells.get(key, 0) >= 3:
             continue
-        single_cells[key] = single_cells.get(key, 0) + 1
-        axis = directions[i]
-        normal = normal_of(axis)
-        extent = int(np.clip(lengths[i] * 0.7, 36, 100))
-        patch, z, _ = sample(mids[i], axis, max_gauge, extent, 1.02)
+        local_cells[key] = local_cells.get(key, 0) + 1
+        local_count += 1
+        u, n = directions[i], normal_of(directions[i])
+        extent = int(np.clip(lengths[i] * 0.55, 32, 80))
+        patch, z, _ = sample(mids[i], u, max_gauge, extent, 1.02)
         if len(patch) < extent * 0.6:
             continue
         profile = patch.mean(axis=0)
-        smooth = cv2.GaussianBlur(profile[None, :], (0, 1), sigmaX=3.0).ravel()
+        smooth = cv2.GaussianBlur(profile[None, :], (0, 1), sigmaX=2.4).ravel()
         ridge = np.abs(profile - smooth)
-        zero = np.flatnonzero(np.abs(z) <= 3)
-        base_strength = float(np.max(ridge[zero]))
-        if base_strength < 2.0:
-            continue
         peaks = np.flatnonzero(
-            (ridge[1:-1] > ridge[:-2]) & (ridge[1:-1] >= ridge[2:])
-            & (ridge[1:-1] >= max(2.0, base_strength * 0.3))
+            (ridge[1:-1] > ridge[:-2]) & (ridge[1:-1] >= ridge[2:]) & (ridge[1:-1] >= 1.7)
         ) + 1
-        peaks = peaks[
-            (np.abs(z[peaks]) >= 5)
-            & (np.abs(z[peaks]) <= min(max_gauge, lengths[i] * 2))
-        ]
-        peaks = peaks[np.argsort(-ridge[peaks], kind="stable")]
+        peaks = peaks[np.argsort(-ridge[peaks], kind="stable")[:18]]
+        candidates = []
+        for ai in range(len(peaks)):
+            for bi in range(ai + 1, len(peaks)):
+                a, b = sorted((int(peaks[ai]), int(peaks[bi])))
+                width = float(z[b] - z[a])
+                shift = float((z[a] + z[b]) * 0.5)
+                if not 3.5 <= width <= min(max_gauge, lengths[i] * 1.8):
+                    continue
+                if abs(shift) > max(12.0, width * 0.65):
+                    continue
+                score = min(float(ridge[a]), float(ridge[b]))
+                score /= 1 + abs(shift) / max(8.0, width)
+                candidates.append((score, shift, width))
+        candidates.sort(key=lambda item: -item[0])
         chosen = []
-        for k in peaks:
-            offset = float(z[k])
-            if any(abs(offset - old) < max(3, abs(offset) * 0.18) for old in chosen):
+        for score, shift, width in candidates:
+            if any(
+                abs(shift - old[0]) < max(2, width * 0.15)
+                and abs(width - old[1]) < max(2, width * 0.20) for old in chosen
+            ):
                 continue
-            chosen.append(offset)
-            center = mids[i] + normal * (offset * 0.5)
+            chosen.append((shift, width))
+            center = mids[i] + n * shift
             if inside(center):
-                single_proposals.append((
-                    min(float(lengths[i]), 100.0), center, axis.copy(), abs(offset)
-                ))
-            if len(chosen) >= 3:
+                local_proposals.append((min(float(lengths[i]), 120.0), center, u.copy(), width))
+            if len(chosen) >= 4:
                 break
-        if sum(single_cells.values()) >= 180:
+        if local_count >= 190:
             break
-
     ordered, deferred, proposal_cells = [], [], {}
     for proposal in proposals:
-        key = tuple((proposal[1] // 160).astype(int))
+        key = tuple((proposal[1] // cell_size).astype(int))
         count = proposal_cells.get(key, 0)
-        if count < 5:
+        if count < 4:
             ordered.append(proposal)
             proposal_cells[key] = count + 1
         else:
             deferred.append(proposal)
-    ordered.extend(deferred)
-    ordered = ordered[:540] + single_proposals[:270] + ordered[540:]
-
+    primary = ordered + deferred
+    ordered = []
+    for i in range(max(len(primary), len(local_proposals))):
+        if i < len(primary):
+            ordered.append(primary[i])
+        if i < len(local_proposals):
+            ordered.append(local_proposals[i])
+    timings["proposal_generation"] += time.perf_counter() - t
     seeds, attempted = [], []
     for support, center, axis, gauge in ordered:
         if not 3.5 <= gauge <= max_gauge:
             continue
-        normal = normal_of(axis)
+        n = normal_of(axis)
         duplicate = False
         for old_center, old_axis, old_width in attempted:
             d = center - old_center
             if (
                 abs(float(axis @ old_axis)) > 0.995
-                and abs(float(d @ normal)) < max(3.0, gauge * 0.25)
+                and abs(float(d @ n)) < max(3.0, gauge * 0.25)
                 and abs(float(d @ axis)) < max(28.0, gauge * 1.5)
                 and abs(gauge - old_width) < max(2.0, gauge * 0.18)
             ):
@@ -615,14 +663,11 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
             continue
         attempted.append((center, axis, gauge))
         extent = extent_for(gauge)
-        fit = fit_section(center, axis, gauge, min(extent, 80))
+        fit = fit_section(center, axis, gauge, min(extent, 72), 1.2)
         if fit is not None:
             point, width, strength = fit
             quality = evidence(point, axis, width, extent, True)
-            if (
-                quality < 0.075 and width >= 5 and strength >= 2
-                and support >= max(23, width * 0.75)
-            ):
+            if quality < 0.075 and strength >= 2 and support >= max(23, width * 0.75):
                 quality = rectified_evidence(point, axis, width, extent)
                 if quality >= 0.075:
                     confirmed = False
@@ -635,9 +680,7 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                             continue
                         confirmation = evidence(f[0], axis, f[1], extent_for(f[1]), True)
                         if confirmation < 0.075:
-                            confirmation = rectified_evidence(
-                                f[0], axis, f[1], extent_for(f[1])
-                            )
+                            confirmation = rectified_evidence(f[0], axis, f[1], extent_for(f[1]))
                         if confirmation >= 0.075:
                             confirmed = True
                             break
@@ -645,71 +688,58 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                         quality = 0.0
             if quality >= 0.075:
                 seeds.append((quality, point, axis, width))
-        if len(attempted) >= 930 or len(seeds) >= 40:
+        if len(attempted) >= 760 or len(seeds) >= 32:
             break
     if not seeds:
         return []
     seeds.sort(key=lambda item: -item[0])
-    rectification_left[0] = max(rectification_left[0], 80)
-    recovery_left = [36]
+    rectification_left[0] = max(rectification_left[0], 70)
+    recovery_left = [30]
+
+    def bridge(a, ua, wa, b, ub, wb):
+        gap = float(np.linalg.norm(b - a))
+        count = max(3, int(np.ceil(gap / 18)) + 1)
+        nodes = []
+        for fraction in np.linspace(0, 1, count, dtype=np.float32)[1:-1]:
+            f2, f3 = fraction * fraction, fraction ** 3
+            point = (
+                (2 * f3 - 3 * f2 + 1) * a + (f3 - 2 * f2 + fraction) * gap * ua
+                + (-2 * f3 + 3 * f2) * b + (f3 - f2) * gap * ub
+            )
+            if not inside(point):
+                return []
+            nodes.append((point, float(wa * (1 - fraction) + wb * fraction)))
+        return nodes
 
     def recover(current, axis, width):
         if recovery_left[0] <= 0:
             return None
         recovery_left[0] -= 1
-        maximum = min(diagonal * 0.08, max(120, width * 5.5))
-        best = None
+        maximum = min(diagonal * 0.08, max(150, width * 6))
         distances = np.linspace(max(30, width * 1.1), maximum, 5)
         for distance in distances:
             candidates = []
-            for angle in (-0.12, -0.06, 0.0, 0.06, 0.12):
+            for angle in (-0.14, -0.07, 0.0, 0.07, 0.14):
                 heading, v = rotate(axis, angle * 0.5), rotate(axis, angle)
                 expected = current + heading * distance
                 if not inside(expected):
                     continue
                 for factor in (0.90, 1.0, 1.10):
                     fit = fit_section(
-                        expected, v, width * factor,
-                        int(np.clip(width * 1.5, 32, 80)), 1.3,
+                        expected, v, width * factor, int(np.clip(width * 1.5, 28, 80)), 1.3
                     )
-                    if fit is None or not inside(fit[0]):
+                    if fit is None or not inside(fit[0]) or fit[2] < 2:
                         continue
-                    point, next_width, strength = fit
-                    if strength < 2.0:
-                        continue
-                    candidates.append((
-                        strength - 10 * abs(angle) - 4 * abs(factor - 1),
-                        point, next_width, v,
-                    ))
+                    score = fit[2] - 10 * abs(angle) - 4 * abs(factor - 1)
+                    candidates.append((score, fit[0], fit[1], v))
             candidates.sort(key=lambda item: -item[0])
-            for _, point, next_width, v in candidates[:2]:
+            for _, point, next_width, v in candidates[:3]:
                 quality = evidence(point, v, next_width, extent_for(next_width), True)
                 if quality < 0.075:
                     quality = rectified_evidence(point, v, next_width, extent_for(next_width))
-                if quality < 0.075:
-                    continue
-                score = quality - distance / max(maximum, 1) * 0.025
-                if best is None or score > best[0]:
-                    best = (score, point, next_width, v)
-            if best is not None:
-                break
-        return best
-
-    def bridge(a, ua, wa, b, ub, wb):
-        gap = float(np.linalg.norm(b - a))
-        count = max(3, int(np.ceil(gap / 22)) + 1)
-        ts = np.linspace(0, 1, count, dtype=np.float32)[1:-1]
-        nodes = []
-        for t in ts:
-            t2, t3 = t * t, t * t * t
-            point = (
-                (2 * t3 - 3 * t2 + 1) * a + (t3 - 2 * t2 + t) * gap * ua
-                + (-2 * t3 + 3 * t2) * b + (t3 - t2) * gap * ub
-            )
-            if not inside(point):
-                return []
-            nodes.append((point, float(wa * (1 - t) + wb * t)))
-        return nodes
+                if quality >= 0.075:
+                    return quality, point, next_width, v
+        return None
 
     def trace(center, axis, gauge, sign):
         u = axis * sign
@@ -719,9 +749,20 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         trusted_u, trusted_width = u.copy(), width
         recoveries = 0
         for iteration in range(int(diagonal / 12) + 2):
-            step = float(np.clip(width * 0.75, 14, 42))
+            step = float(np.clip(width * 0.75, 12, 40))
             expected = current + u * step
             if not inside(expected):
+                limits = []
+                for k, maximum in ((0, w - 1), (1, h - 1)):
+                    if abs(float(u[k])) > 1e-6:
+                        boundary = maximum if u[k] > 0 else 0
+                        limits.append((boundary - float(current[k])) / float(u[k]))
+                positive = [x for x in limits if x >= 0]
+                if positive and unverified < max(28, width):
+                    distance = min(positive)
+                    if 0.5 < distance <= step:
+                        nodes.append((current + u * distance, width))
+                        last_good = len(nodes) - 1
                 break
             best = None
             for angle in (-0.08, -0.04, 0.0, 0.04, 0.08):
@@ -729,10 +770,9 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                 fit = fit_section(expected, v, width, int(np.clip(width * 1.6, 28, 84)))
                 if fit is None or not inside(fit[0]):
                     continue
-                point, next_width, strength = fit
-                score = strength - abs(angle) * 8
+                score = fit[2] - abs(angle) * 8
                 if best is None or score > best[0]:
-                    best = (score, point, next_width, v)
+                    best = (score, fit[0], fit[1], v)
             unverified += step
             if best is None:
                 current = expected
@@ -754,8 +794,8 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                         unverified = 0.0
                         trusted_point = point.copy()
                         trusted_u, trusted_width = u.copy(), width
-            if unverified > max(70, trusted_width * 2.5):
-                if recoveries >= 3:
+            if unverified > max(72, trusted_width * 2.5):
+                if recoveries >= 4:
                     break
                 recovered = recover(trusted_point, trusted_u, trusted_width)
                 if recovered is None:
@@ -767,10 +807,8 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                 ))
                 nodes.append((point.copy(), next_width))
                 current, u, width = point.copy(), v, float(next_width)
-                trusted_point = current.copy()
-                trusted_u, trusted_width = u.copy(), width
-                last_good = len(nodes) - 1
-                unverified = 0.0
+                trusted_point, trusted_u, trusted_width = current.copy(), u.copy(), width
+                last_good, unverified = len(nodes) - 1, 0.0
                 recoveries += 1
         if last_good >= 0:
             return nodes[:min(len(nodes), last_good + 2)]
@@ -778,14 +816,20 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
 
     def distance_to_path(point, path):
         a, d = path[:-1], np.diff(path, axis=0)
-        t = np.sum((point - a) * d, axis=1)
-        t /= np.maximum(np.sum(d * d, axis=1), 1e-6)
-        foot = a + np.clip(t, 0, 1)[:, None] * d
+        fractions = np.sum((point - a) * d, axis=1)
+        fractions /= np.maximum(np.sum(d * d, axis=1), 1e-6)
+        foot = a + np.clip(fractions, 0, 1)[:, None] * d
         return float(np.min(np.linalg.norm(foot - point, axis=1)))
 
     def path_length(path):
         return float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())
 
+    def endpoint_direction(path, at_end):
+        if at_end:
+            return unit(path[-1] - path[max(0, len(path) - 4)])
+        return unit(path[min(3, len(path) - 1)] - path[0])
+
+    tracing_started = time.perf_counter()
     tracks = []
     for quality, center, axis, gauge in seeds:
         if any(distance_to_path(center, path) < max(5, gauge * 0.4) for path, _ in tracks):
@@ -803,15 +847,9 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         if len(path) < 3 or path_length(path) < max(35, minimum_length * 0.2):
             continue
         tracks.append((path, widths))
-        if len(tracks) >= 24:
+        if len(tracks) >= 20:
             break
-
-    def endpoint_direction(path, at_end):
-        if at_end:
-            return unit(path[-1] - path[max(0, len(path) - 4)])
-        return unit(path[min(3, len(path) - 1)] - path[0])
-
-    for _ in range(24):
+    for _ in range(20):
         best = None
         for i in range(len(tracks)):
             for j in range(i + 1, len(tracks)):
@@ -840,9 +878,11 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
                             or abs(float(wa[-1] - wb[0])) > max(3, mean_width * 0.32)
                         ):
                             continue
-                        la = abs(float(delta[0] * ua[1] - delta[1] * ua[0]))
-                        lb = abs(float(delta[0] * ub[1] - delta[1] * ub[0]))
-                        if max(la, lb) > max(5, mean_width * 0.6):
+                        lateral = max(
+                            abs(float(delta @ normal_of(ua))),
+                            abs(float(delta @ normal_of(ub)))
+                        )
+                        if lateral > max(5, mean_width * 0.6):
                             continue
                         score = gap / max(mean_width, 4)
                         if best is None or score < best[0]:
@@ -852,18 +892,15 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         _, i, j, pa, wa, pb, wb, ua, ub = best
         middle = bridge(pa[-1], ua, wa[-1], pb[0], ub, wb[0])
         if middle:
-            bridge_path = np.asarray([node[0] for node in middle], np.float32)
-            bridge_widths = np.asarray([node[1] for node in middle], np.float32)
-            tracks[i] = (
-                np.vstack((pa, bridge_path, pb)), np.concatenate((wa, bridge_widths, wb))
-            )
+            mp = np.asarray([node[0] for node in middle], np.float32)
+            mw = np.asarray([node[1] for node in middle], np.float32)
+            tracks[i] = np.vstack((pa, mp, pb)), np.concatenate((wa, mw, wb))
         else:
-            tracks[i] = (np.vstack((pa, pb)), np.concatenate((wa, wb)))
+            tracks[i] = np.vstack((pa, pb)), np.concatenate((wa, wb))
         tracks.pop(j)
-
     tracks.sort(key=lambda item: -path_length(item[0]))
     output, accepted_paths = [], []
-    rectification_left[0] = max(rectification_left[0], 64)
+    rectification_left[0] = max(rectification_left[0], 48)
     for path, widths in tracks:
         if len(path) > 4:
             path = path.copy()
@@ -886,7 +923,7 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         tangents[1:-1] = path[2:] - path[:-2]
         tangents /= np.maximum(np.linalg.norm(tangents, axis=1, keepdims=True), 1e-6)
         positions = np.linspace(
-            length * 0.10, length * 0.90, min(11, max(3, int(length / 90) + 1))
+            length * 0.08, length * 0.92, min(11, max(3, int(length / 90) + 1))
         )
         verified, checked = [], set()
         for position in positions:
@@ -897,7 +934,21 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
             width = float(widths[k])
             extent = extent_for(width)
             quality = evidence(path[k], tangents[k], width, extent, True)
-            if quality < 0.075 and width >= 5:
+            if quality < 0.075:
+                # Verify the traced curve and changing gauge on native pixels.
+                start = max(0.0, float(arc[k]) - extent * 0.5)
+                stop = min(length, float(arc[k]) + extent * 0.5)
+                ts = np.linspace(start, stop, max(9, int((stop - start) / 8) + 1))
+                local_path = np.column_stack([
+                    np.interp(ts, arc, path[:, d]) for d in range(2)
+                ]).astype(np.float32)
+                local_widths = np.interp(ts, arc, widths)
+                started = time.perf_counter()
+                result = path_patch(local_path, local_widths)
+                if result is not None:
+                    quality = patch_evidence(*result, True)
+                timings["verification"] += time.perf_counter() - started
+            if quality < 0.075:
                 quality = rectified_evidence(path[k], tangents[k], width, extent)
             if quality >= 0.075:
                 verified.append(float(arc[k]))
@@ -929,11 +980,10 @@ def process_frame(src: np.ndarray, reference_shape=None) -> list[dict[str, objec
         output.append({
             "left_rail": left.astype(float).tolist(),
             "right_rail": right.astype(float).tolist(),
-            # Evidence coverage, not a calibrated probability of correctness.
-            # Reuse existing verification; do not alter acceptance or geometry.
             "confidence": float(len(verified) / len(checked)),
-            "confidence_method": "verified_patch_fraction_v1",
+            "confidence_method": "verified_patch_fraction_v1"
         })
         if len(output) >= 6:
             break
+    timings["tracing"] += time.perf_counter() - tracing_started
     return output

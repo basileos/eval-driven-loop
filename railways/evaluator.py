@@ -387,9 +387,13 @@ def evaluate_sample(sample: EvaluationSample) -> dict[str, object]:
             raise RuntimeError("Candidate worker was not initialized.")
 
         img_shape = read_image_shape(img_path)
+        # A worker handles multiple samples; never reuse another image's stages.
+        if hasattr(_WORKER_PROCESS_IMAGE, "last_timings"):
+            _WORKER_PROCESS_IMAGE.last_timings = {}
         started_at = time.perf_counter()
         raw_prediction = _WORKER_PROCESS_IMAGE(img_path)
         elapsed = time.perf_counter() - started_at
+        stage_timings = read_stage_timings(_WORKER_PROCESS_IMAGE)
         pred_tracks = validate_predicted_tracks(raw_prediction, img_shape)
 
         metrics = calculate_polygon_metrics(
@@ -407,6 +411,7 @@ def evaluate_sample(sample: EvaluationSample) -> dict[str, object]:
             **metrics,
             **size_metrics,
             "elapsed": elapsed,
+            "stage_timings_seconds": stage_timings,
             "ground_truth_tracks": len(gt_tracks),
             "predicted_tracks": len(pred_tracks),
             "ground_truth_data": gt_tracks,
@@ -434,12 +439,50 @@ def evaluate_sample(sample: EvaluationSample) -> dict[str, object]:
             "minimum_predicted_rail_length_ratio": None,
             "undersized_predicted_tracks": 0,
             "elapsed": 0.0,
+            "stage_timings_seconds": {},
             "ground_truth_tracks": len(gt_tracks),
             "predicted_tracks": 0,
             "ground_truth_data": gt_tracks,
             "prediction_data": [],
             "error": traceback.format_exc(limit=12),
         }
+
+
+def read_stage_timings(process_image) -> dict[str, float]:
+    """Optional, candidate-reported inclusive spans; never trusted for scoring."""
+    raw = getattr(process_image, "last_timings", None)
+    if not isinstance(raw, dict):
+        return {}
+    timings = {}
+    for name, value in list(raw.items())[:16]:
+        if (isinstance(name, str) and name.isidentifier() and len(name) <= 64
+                and isinstance(value, numbers.Real) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0):
+            timings[name] = float(value)
+    return timings
+
+
+def summarize_timings(results, wall_seconds):
+    """Call latency differs from parallel evaluator throughput and live FPS."""
+    elapsed = np.asarray([float(row['elapsed']) for row in results], dtype=float)
+    total = float(elapsed.sum())
+    metrics = {
+        'mean_image_seconds': float(elapsed.mean()) if len(elapsed) else 0.0,
+        'p50_image_seconds': float(np.percentile(elapsed, 50)) if len(elapsed) else 0.0,
+        'p95_image_seconds': float(np.percentile(elapsed, 95)) if len(elapsed) else 0.0,
+        'max_image_seconds': float(elapsed.max()) if len(elapsed) else 0.0,
+        'serial_fps_estimate': len(elapsed) / total if total else 0.0,
+        'evaluation_fps': len(elapsed) / wall_seconds if wall_seconds > 0 else 0.0,
+    }
+    stages = {}
+    for row in results:
+        for name, value in row.get('stage_timings_seconds', {}).items():
+            stages.setdefault(name, []).append(value)
+    # Missing instrumentation is unknown, not a zero-second measurement.
+    stages = {name: dict(samples=len(values), mean_seconds=float(np.mean(values)),
+                         p95_seconds=float(np.percentile(values, 95)))
+              for name, values in sorted(stages.items())}
+    return metrics, stages
 
 
 def evaluate_samples_parallel(
@@ -727,6 +770,7 @@ def _format_debug_metrics(result: dict[str, object]) -> dict[str, object]:
         "ground_truth_bbox": result["gt_bbox"],
         "prediction_bbox": result["pred_bbox"],
         "elapsed_seconds": float(result["elapsed"]),
+        "stage_timings_seconds": result.get("stage_timings_seconds", {}),
         "minimum_predicted_rail_length_px": result[
             "minimum_predicted_rail_length_px"
         ],
@@ -903,6 +947,7 @@ def evaluate(
         float(total_intersection / total_pred_area) if total_pred_area else 0.0
     )
     slowest = max(results, key=lambda result: float(result["elapsed"]))
+    timing_metrics, stage_timings = summarize_timings(results, wall_time)
     positives = [
         result for result in results if int(result["ground_truth_tracks"]) > 0
     ]
@@ -986,13 +1031,21 @@ def evaluate(
         f"intersection_px={total_intersection} union_px={total_union}"
     )
     print(
+        "TIMING: process_image latency includes candidate decoding; excludes "
+        "scoring/overlays. serial_fps_estimate=1/mean_latency under current worker "
+        "contention; evaluation_fps is parallel dataset throughput, NOT live-video FPS."
+    )
+    print("TIMING_STAGES: candidate-reported inclusive spans (may overlap); "
+          + (json.dumps(stage_timings, sort_keys=True) if stage_timings else "unavailable (candidate not instrumented)"))
+    print(
         f"METRICS: dataset_iou={dataset_iou:.6f} "
         f"mean_positive_iou={mean_positive_iou:.6f} "
         f"positive_coverage={positive_coverage:.6f} "
         f"polygon_precision={polygon_precision:.6f} "
         f"false_positive_rate={false_positive_rate:.6f} "
         f"detected_positive_rate={detected_positive_rate:.6f} "
-        f"wall_seconds={wall_time:.3f}"
+        f"wall_seconds={wall_time:.3f} "
+        + " ".join(f"{name}={value:.6f}" for name, value in timing_metrics.items())
     )
     for result in results:
         gt_area = int(result["gt_area"])
@@ -1024,7 +1077,7 @@ def evaluate(
             f"precision={float(result['precision']):.4f} "
             f"area_ratio={area_ratio_text} dx={dx_text} dy={dy_text} "
             f"min_rail_px={minimum_rail_text} "
-            f"min_rail_ratio={minimum_rail_ratio_text}"
+            f"min_rail_ratio={minimum_rail_ratio_text} elapsed_seconds={float(result['elapsed']):.6f}"
         )
     if undersized_predictions:
         print(

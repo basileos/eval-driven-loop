@@ -217,16 +217,16 @@ class VideoRunnerTests(unittest.TestCase):
         self.assertEqual([row["frame_index"] for row in records], [1, 3])
         self.assertEqual(self.read_results()['summary']["stop_reason"], "end_time")
 
-    def test_streaming_keeps_all_file_frames_and_throttles_empty_search(self):
+    def test_streaming_keeps_all_file_frames_and_searches_without_cooldown(self):
         predict = Mock(return_value=[])
         self.assertEqual(self.run_video('--streaming', '--workers', '4', '--no-overlays', process_image=predict), 0)
-        self.assertEqual(predict.call_count, 1)
+        self.assertEqual(predict.call_count, 5)
         self.assertEqual(self.read_results()['summary']['processed_frames'], 5)
-        self.assertEqual(self.read_results()['summary']['streaming_modes'], {'search': 1, 'search_wait': 4})
+        self.assertEqual(self.read_results()['summary']['streaming_modes'], {'search': 5})
         self.assertFalse(self.read_results()['run']['live_latest_frame'])
         self.assertEqual(self.read_results()['run']['workers'], 1)
         self.assertEqual(self.read_frame(0)['streaming']['mode'], 'search')
-        self.assertEqual(self.read_frame(1)['streaming']['mode'], 'search_wait')
+        self.assertEqual(self.read_frame(1)['streaming']['mode'], 'search')
 
     def test_streaming_live_limits_saved_results_not_capture(self):
         capture = Mock()

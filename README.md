@@ -68,12 +68,16 @@ Rows are sorted by minimum height in ascending order.
 
 The railway evaluator processes images concurrently in up to four worker processes. Candidate `process_image` implementations must be deterministic, independent between images, and safe to execute in separate processes.
 
-Detection runs at the source image resolution, including line and edge extraction.
-The retained candidate no longer shrinks frames to a 1500-pixel long edge. Future
-candidates are instructed to preserve native pixels; overlapping native-resolution
-tiles are allowed, but downsampling rail evidence is not. This costs more CPU than
-the former reduced-resolution detector, and its accuracy must be evaluated anew.
-The evaluator already scores polygons in original image coordinates.
+The orchestrator now requests **coarse proposals with native-resolution refinement**.
+Generated candidates should run LSD/proposal generation on grayscale fitted inside
+1280 × 720 (or 1920 × 1080 if needed for recall), preserving aspect ratio and never
+upscaling smaller inputs. Map segment endpoints back with `sx = native_width / small_width`
+and `sy = native_height / small_height` before native-unit geometry filtering and
+`fit_section`. Profile fitting, gauge/rail-width checks, sleeper/texture verification,
+and final refinement still use original pixels. Scoring and returned coordinates
+remain native-resolution. The retained detector is not changed by this policy
+update; only an evaluated replacement passing the existing gate can replace it.
+The 4×–9× reduction in proposal pixel count is not a guaranteed runtime speedup.
 
 Model feedback also preserves source dimensions: selected originals and annotated
 PNG copies are attached separately, with no thumbnail montage or combined-image
@@ -287,7 +291,6 @@ State is sequential, so `--streaming` always uses one worker. Default full-searc
 mode is unchanged. No UFLD/model installation or training is involved.
 
 - `--verify-every 10`: fresh ROI evidence every 10 **processed** frames.
-- `--search-every 30`: full-search cooldown when no track is available.
 - `--full-search-every 150`: periodic global refresh, also discovering new tracks.
 - `--roi-margin 96`: native-pixel margin for motion and local re-detection.
 - `--max-track-gap 10`: hard timestamp-gap limit, allowing a handoff after slow
@@ -295,14 +298,17 @@ mode is unchanged. No UFLD/model installation or training is involved.
   robust-transform checks; this does not allow blind extrapolation for 10 seconds.
 
 Lost flow, failed ROI evidence, ambiguous association, and out-of-frame geometry
-clear tracked output. During search cooldown the result is empty and marked
-`search_wait` or `lost`: that is **not a fresh negative classification**. Tracking
+clear tracked output and immediately trigger full-frame reacquisition on the same
+frame (`mode=search`, `reason=tracking_lost`). With no tracks, every available
+input frame runs a full search: there is no search cooldown or `--search-every`
+option. The live player still skips input frames while its worker is busy;
+offline streaming may do more detector work on negative videos. Tracking
 estimates motion of the visible rails, not new geometry beyond the observed path;
 ROI checks/refreshes supply new geometry. A local similarity transform is an
 approximation and can fail under strong perspective changes or occlusion.
 
-JSON's `streaming` object reports mode (`search`, `track`, `roi_verify`, `lost`,
-`search_wait`, or `error`), detector call count/pixels/time, motion time/support,
+JSON's `streaming` object reports mode (`search`, `track`, `roi_verify`, or `error`),
+detector call count/pixels/time, motion time/support,
 and age since verification. Overlays show mode. Motion-only tracks have
 `confidence: null`, not stale detector confidence. Motion support is a tracking
 consistency measure, **not** railway probability. The full-image minimum-length
@@ -328,23 +334,38 @@ do not report only fast motion frames as end-to-end FPS.
 
 ### Orchestrator settings
 
+- `RAILWAYS_LLM_PROVIDER=codex|claude` selects the CLI for implementation, repairs,
+  and architect calls (default: `codex`). See the [Claude launch command](railways/README.md#generate-candidates-with-claude-cli).
+- With Claude selected, `RAILWAYS_CLAUDE_MODEL` defaults to `sonnet`,
+  `RAILWAYS_CLAUDE_REASONING_EFFORT` to `medium`, and `RAILWAYS_CLAUDE_TIMEOUT`
+  to 600 seconds. `RAILWAYS_CODEX_*` settings are ignored for Claude generation.
+  The shared `RAILWAYS_ARCHITECT_MODEL` defaults to `opus` for Claude; explicitly
+  override any exported OpenAI architect model when switching providers.
+  A recent authenticated `claude` CLI is required. Tools, MCP, user/project settings,
+  slash commands and configurable hooks are disabled for generation; managed
+  organizational policies can still apply. Subscription login is retained by
+  not using `--bare`. Native-dimension attachments are embedded as base64;
+  oversized files get JPEG transport copies. Provider-side image resizing can
+  still occur. No detector/evaluator images are resized by this transport.
 - `RAILWAYS_EVAL_WORKERS=<1..4>` controls the worker count.
 - `RAILWAYS_EVAL_TIMEOUT=<seconds>` controls the entire dataset's pool deadline and defaults to 180 seconds. The outer evaluator process gets this budget plus 60 seconds for startup, cleanup, scoring and native-resolution diagnostics. Timeout messages report completed/total images; pending images include queued work, not just stalled frames. Timed-out evaluator process groups are stopped.
 - `RAILWAYS_RUNS_DIR=<path>` defaults to `railways/runs`. Each run keeps its baseline source, generated source (including failed attempts), prompts, model responses, evaluation stdout/stderr, decisions, archive index, and native-resolution feedback. These files are not automatically deleted or resumed; native overlays can consume substantial disk space. The run directory and evaluation budgets are printed at startup.
-- `RAILWAYS_CODEX_TIMEOUT=<seconds>` limits each Codex generation and defaults to 600 seconds, allowing for native-resolution image input. A persistent `GENERATION` line reports model, reasoning, timeout, image count, and total image-file size before each call. Timeout errors include the last available CLI output.
+- `RAILWAYS_CODEX_TIMEOUT=<seconds>` limits each Codex generation and defaults to 600 seconds, allowing for native-resolution image input. A persistent `GENERATION` line reports model, reasoning, timeout, image count, and total image-file size before each call. `GENERATION TIME` reports CLI wall time, including failed/timed-out calls. Timeout errors include the last available CLI output.
 - `RAILWAYS_CODEX_MODEL=<model>` selects the implementation model and defaults to `gpt-5.6-luna`.
 - `RAILWAYS_CODEX_REASONING_EFFORT=<effort>` defaults to `low` for bounded implementation turns; the loop ignores the user's global Codex profile.
 - `RAILWAYS_ARCHITECT_MODEL=<model>` selects the plateau-analysis model and defaults to `gpt-5.6-sol`.
 - `RAILWAYS_ARCHITECT_REASONING_EFFORT=<effort>` defaults to `medium`.
 - `RAILWAYS_ARCHITECT_TIMEOUT=<seconds>` defaults to 600 seconds.
-- `RAILWAYS_MAX_CANDIDATE_LINES=<lines>` defaults to 1000 (including comments and blank lines) and prevents unbounded candidate growth. The generation and repair prompts use this same configured cap.
-- `RAILWAYS_MAX_REPAIR_ATTEMPTS=<count>` defaults to 1; set 0 to disable. Syntax errors, evaluation failures/timeouts, or excessive length trigger a focused repair of the same architecture within the same iteration before the search moves on. Each repair adds at most one generation call and one full-dataset evaluation, using the existing model and deadlines. A successful evaluation with poor IoU/FPR does not trigger a repair; all repaired candidates still face the unchanged acceptance gate. Authentication/transport/generation failures stop the search rather than consuming code-repair retries. Original and repaired source/logs are saved separately (`iteration_XX_strategy_repair_01.*`).
+- Candidate source has no hard line-count limit. Prompts request concise, complete code, but length alone never rejects a candidate or triggers repair. The former `RAILWAYS_MAX_CANDIDATE_LINES` setting is no longer used.
+- `RAILWAYS_MAX_REPAIR_ATTEMPTS=<count>` defaults to 1; set 0 to disable. Syntax errors and evaluation failures/timeouts trigger a focused repair of the same architecture within the same iteration before the search moves on. Each repair adds at most one generation call and one full-dataset evaluation, using the existing model and deadlines. A successful evaluation with poor IoU/FPR does not trigger a repair; all repaired candidates still face the unchanged acceptance gate. Authentication/transport/generation failures stop the search rather than consuming code-repair retries. Original and repaired source/logs are saved separately (`iteration_XX_strategy_repair_01.*`).
 - `RAILWAYS_MAX_STAGNANT_ITERATIONS=<count>` defaults to 3 and triggers a disruption round after that many attempts without a new dataset-IoU best.
 - `RAILWAYS_MAX_DISRUPTION_ROUNDS=<count>` defaults to 1. Set it to 0 to retain stop-on-plateau behavior.
 - `RAILWAYS_PARETO_ARCHIVE_SIZE=<count>` defaults to 4 and limits the in-memory set of non-dominated search parents.
 - `RAILWAYS_MAX_FALSE_POSITIVE_RATE=<0..1>` sets the fixed acceptance ceiling (default `0.10`): the fraction of negative images with any detection. With 41 negatives, at most 4 false-positive frames are permitted. The ceiling does not tighten when the retained detector's FPR decreases. It applies even without a valid baseline; an empty or zero-IoU detector cannot be accepted.
 - The evaluator reports its image count, worker count, wall time, and slowest image before `SCORE`.
-- Each result prints `SUMMARY`, `METRICS`, per-image geometry, and any `DIAGNOSIS`. Separate native-resolution originals and overlays supply the next model with the worst overlaps, a strong positive, and a false-positive negative.
+- Each result prints `SUMMARY`, `METRICS`, `TIMING`, `TIMING_STAGES`, per-image latency/geometry, and any `DIAGNOSIS`. Separate native-resolution originals and overlays supply the next model with the worst overlaps, a strong positive, and a false-positive negative.
+- Timing metrics include mean/p50/p95/maximum `process_image` seconds, `serial_fps_estimate` (1 / mean latency), and `evaluation_fps` (images / dataset wall time). Calls include candidate image decoding but exclude evaluator scoring/overlays. Pool throughput is **not live FPS**; call latency with four competing workers is not a single-worker benchmark either. Use `RAILWAYS_EVAL_WORKERS=1` and the same dataset/worker setting for comparable serial measurements. Timing is diagnostic; strictly better IoU and the fixed FPR ceiling are still required, so speed alone does not qualify an equal-IoU candidate.
+- Generated candidates are asked to publish `process_image.last_timings`, a per-call dictionary of stage seconds measured with `time.perf_counter()`. Suggested stages are `decode`, `preprocess`, `lsd`, `proposal_generation`, `profile_fitting`, `tracing`, and `total`. Reset and publish on every call, including early returns. Inclusive stages can overlap and must not be summed. The evaluator clears stale values between images, ignores invalid entries, and reports per-stage mean/p95 with sample counts. Missing instrumentation is reported as unavailable, not zero. Stage timings are candidate-reported diagnostics, not trusted acceptance criteria; the retained baseline may have none. Stage summaries remain in evaluator stdout artifacts, and per-image stage values are included in diagnostic JSON. Each attempt/repair also saves `.timing.json` with evaluation-attempt wall time including scoring and diagnostics.
 - The orchestrator first evaluates the existing candidate as a baseline. File replacement requires the fixed false-positive gate plus strictly higher dataset IoU. Equal or lower IoU is never accepted. A baseline above the ceiling is preserved until a qualifying replacement is found; failure to find one is reported explicitly.
 - `railways/candidate_conservative.py` independently preserves the highest dataset-IoU candidate with exactly zero validation FPR and positive overlap, even if it does not beat the main candidate's IoU or survive the Pareto archive. Baseline detectors qualify too. Existing conservative source is re-evaluated on each run (or reuses the baseline evaluation if identical), so changed datasets do not reuse stale metrics. Failed/nonqualifying alternatives remain on disk but are reported as unverified/nonqualifying; a newly verified alternative may replace them, with the previous source backed up in the run directory. Every improvement saves `conservative_best.py` and metrics in the run directory. This is validation performance, not a guarantee of zero false positives on unseen footage.
 - Lower-scoring candidates or candidates failing the FPR ceiling may remain in the in-memory Pareto archive as search parents. They cannot replace the retained file or trigger target-score completion. Completion requires an accepted candidate with IoU at least `0.8`.

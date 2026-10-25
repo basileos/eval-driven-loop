@@ -10,22 +10,32 @@ from unittest.mock import Mock, patch
 import cv2
 import numpy as np
 
-from railways import candidate_script, evaluator, orchestrator
+from railways import evaluator, orchestrator
 
 
 class FullResolutionTests(unittest.TestCase):
-    def test_line_detector_receives_all_4k_pixels(self):
+    def test_coarse_proposals_still_receive_native_input_and_score_native_coordinates(self):
         source = np.zeros((2160, 3840, 3), dtype=np.uint8)
         seen = []
-        detector = Mock()
-        detector.detect.side_effect = lambda gray: (seen.append(gray.shape),)[0:1]
-        with (
-            patch.object(cv2, "resize", side_effect=AssertionError("No downsampling")),
-            patch.object(cv2, "createLineSegmentDetector", return_value=detector),
-            patch.object(cv2, "imread", return_value=source),
-        ):
-            self.assertEqual(candidate_script.process_image("native-frame.png"), [])
-        self.assertEqual(seen, [(2160, 3840)])
+        tracks = [{"left_rail": [[1200, 600], [1200, 1800]],
+                   "right_rail": [[1240, 600], [1240, 1800]]}]
+        def process_image(path):
+            original = cv2.imread(path)
+            small = cv2.resize(cv2.cvtColor(original, cv2.COLOR_BGR2GRAY), (1280, 720))
+            seen.append((original.shape, small.shape))
+            return tracks
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'native.png'
+            self.assertTrue(cv2.imwrite(str(path), source))
+            with (
+                patch.object(evaluator, '_WORKER_PROCESS_IMAGE', process_image),
+                patch.object(evaluator, '_WORKER_INIT_ERROR', None),
+            ):
+                result = evaluator.evaluate_sample((path.name, str(path), tracks))
+        self.assertIsNone(result['error'])
+        self.assertEqual(seen, [((2160, 3840, 3), (720, 1280))])
+        self.assertEqual(result['image_shape'], (2160, 3840))
+        self.assertEqual(result['score'], 1.0)
 
     def test_context_preserves_dimensions_and_separate_originals(self):
         with tempfile.TemporaryDirectory() as temporary:

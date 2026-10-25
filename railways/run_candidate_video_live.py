@@ -231,7 +231,7 @@ def main(argv=None):
         raise ValueError('Source video and candidate must exist.')
     options = None
     if args.streaming:
-        options = dict(verify_every=args.verify_every, search_every=args.search_every,
+        options = dict(verify_every=args.verify_every,
                        full_search_every=args.full_search_every, roi_margin=args.roi_margin,
                        max_gap_seconds=args.max_track_gap)
     capture = cv2.VideoCapture(str(source))

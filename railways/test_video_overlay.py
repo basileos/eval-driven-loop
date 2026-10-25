@@ -93,9 +93,9 @@ class VideoOverlayTests(unittest.TestCase):
     def test_streaming_and_frame_limit(self):
         predict = Mock(return_value=[])
         self.assertEqual(self.run_overlay('--streaming', '--max-frames', '3', predict=predict), 0)
-        self.assertEqual(predict.call_count, 1)
+        self.assertEqual(predict.call_count, 3)
         self.assertEqual(len(self.decoded()[1]), 3)
-        self.assertEqual(self.results()['summary']['processing_modes'], {'search': 1, 'search_wait': 2})
+        self.assertEqual(self.results()['summary']['processing_modes'], {'search': 3})
 
     def test_mp4_default_encoder(self):
         self.output = self.root / 'annotated.mp4'

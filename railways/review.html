@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Railway review</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {color-scheme:light; font:14px/1.5 system-ui,sans-serif; color:#1c3140; background:#eef3f5; --teal:#087d79; --line:#d8e2e7;}
+    * {box-sizing:border-box} body {margin:0} button,input,select {font:inherit} button,select,input[type=file] {cursor:pointer}
+    button {border:1px solid #c7d5dd; border-radius:7px; background:white; color:#193444; padding:7px 12px; font-weight:600}
+    button:hover:not(:disabled) {background:#edf8f7; border-color:var(--teal)} button:disabled {opacity:.4;cursor:default}
+    :focus-visible {outline:3px solid #36b8ba;outline-offset:3px} h1,h2,p {margin:0} h1 {font-size:25px;letter-spacing:-.6px} h2 {font-size:15px}
+    header {background:#112b39;color:#fff;border-bottom:3px solid #169e99} .header-inner {max-width:1180px;margin:auto;padding:22px 24px;display:flex;justify-content:space-between;align-items:center;gap:20px}
+    header p {color:#b5cbd6;font-size:13px;margin-top:3px} .local {font-size:11px;letter-spacing:1.5px;border:1px solid #456170;border-radius:20px;padding:5px 11px;white-space:nowrap}
+    main {max-width:1180px;margin:auto;padding:22px 24px 35px} .uploads {display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+    .upload {padding:15px 18px;border:1px solid var(--line);border-radius:10px;background:white;min-width:0}.upload label {font-weight:650;display:block;margin-bottom:8px}
+    input[type=file] {width:100%;font-size:12px;color:#516773} input::file-selector-button {border:0;background:#e8f3f2;color:#16655f;border-radius:5px;padding:7px 10px;margin-right:10px;font-weight:600;cursor:pointer}
+    .hint {color:#647b87;font-size:12px;margin-top:7px} #messages {white-space:pre-line;border-radius:7px;margin-bottom:14px;padding:10px 14px;background:#fff5dc;color:#75531a} #messages.error {background:#ffedee;color:#992a35} [hidden] {display:none!important}
+    .viewer {border-radius:12px;overflow:hidden;border:1px solid var(--line);background:white;box-shadow:0 3px 12px #19384908}
+    .viewer-top {padding:11px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap} #range-info {color:#546e7c;font-variant-numeric:tabular-nums;font-size:12px}
+    .stage {position:relative;aspect-ratio:16/9;background:#08151d;width:100%;overflow:hidden} video, #overlay {position:absolute;width:100%;height:100%;inset:0} video {object-fit:contain} #overlay {pointer-events:none}
+    .empty {position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;text-align:center;color:#c2d5df;padding:24px}.empty svg {width:48px;height:48px;color:#389a9a}.empty small {color:#7e9eae}
+    #frame-badge {position:absolute;top:12px;left:12px;padding:4px 9px;background:#06121bd9;color:#d8edf4;font:12px ui-monospace,monospace;border-radius:4px;pointer-events:none}
+    .transport {padding:14px 16px}.buttons {display:flex;gap:8px;flex-wrap:wrap;align-items:center}.primary {background:var(--teal);color:#fff;border-color:var(--teal);min-width:105px}.primary:hover:not(:disabled) {background:#066b68;color:white}
+    .separator {width:1px;height:24px;background:var(--line);margin:0 4px}.settings {margin-left:auto;display:flex;gap:12px;align-items:center;font-size:12px;flex-wrap:wrap} label.check {display:flex;gap:5px;align-items:center}
+    input[type=checkbox],input[type=range] {accent-color:var(--teal)} select {border:1px solid var(--line);border-radius:5px;padding:5px;background:white;color:inherit}
+    .timeline {margin-top:15px} #marks {display:block;width:100%;height:10px;border-radius:3px;background:#eef3f5} #scrubber {width:100%;margin:4px 0;display:block}
+    .time-row {display:flex;gap:12px;align-items:center;justify-content:space-between;font:12px ui-monospace,monospace;color:#536c79}.frame-jump {display:flex;align-items:center;gap:6px}.frame-jump input {width:92px;border:1px solid var(--line);border-radius:4px;padding:4px;color:#1c3140}
+    .review-grid {display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:16px;margin-top:16px}.panel {background:white;border:1px solid var(--line);border-radius:10px;padding:16px;min-width:0}
+    .panel-title {display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.badge {display:inline-block;font-size:12px;border-radius:5px;background:#edf2f5;color:#556d7b;padding:4px 8px}.badge.positive {background:#dcf5ec;color:#15684e}.badge.error {background:#ffe6e8;color:#992a35}.badge.waiting {background:#fff1d5;color:#8a651c}
+    dl {display:grid;grid-template-columns:1fr 1fr;gap:5px 18px;margin:12px 0} dt {color:#6b7f8a;font-size:12px} dd {margin:0;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+    #frame-note {font-size:12px;color:#647b87;margin-top:9px} #record-error {font:12px ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:140px;overflow:auto;background:#fff0f0;padding:8px;color:#8a2730}
+    .legend {display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#5c7481;margin-top:12px}.dot {display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}.left {background:#00ddea}.right {background:#ec5cda}.fill {background:#60d58a}
+    .table-wrap {height:216px;overflow:auto;border:1px solid #e2eaee;border-radius:6px} table {border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums} th {position:sticky;top:0;background:#f4f7f8;text-align:left;font-weight:600;color:#607985} th,td {padding:6px 9px;border-bottom:1px solid #edf1f3;white-space:nowrap} tr.active td {background:#e2f5f1} td button {padding:0;border:0;color:#087d79;background:transparent;font:inherit;text-decoration:underline;text-underline-offset:3px}
+    .pagination {display:flex;align-items:center;justify-content:space-between;margin-top:9px;font-size:12px;color:#5e7683}.pagination button {padding:3px 9px}.footnote {margin-top:15px;color:#617987;font-size:12px} kbd {font:11px ui-monospace,monospace;background:white;border:1px solid #cfdae0;border-radius:3px;padding:1px 4px}
+    @media(max-width:760px) {main {padding:14px 12px}.header-inner {padding:17px 14px}.uploads,.review-grid {grid-template-columns:1fr}.settings {margin-left:0}.separator {display:none}h1 {font-size:22px}.local {display:none}.buttons button {font-size:12px}.time-row {flex-wrap:wrap}}
+  </style>
+  <script defer src="review_results.js"></script>
+  <script defer src="review.js"></script>
+</head>
+<body>
+  <header><div class="header-inner"><div><h1>Railway review</h1><p>Inspect saved detections on their original video frames.</p></div><span class="local">LOCAL FILES ONLY</span></div></header>
+  <main>
+    <section class="uploads" aria-label="Load review files">
+      <div class="upload"><label for="video-file">1. Source video</label><input id="video-file" type="file" accept="video/*,.mp4,.mov,.webm,.m4v"><p class="hint">Choose the original full-length video, not the annotated export.</p></div>
+      <div class="upload"><label for="json-file">2. Results JSON</label><input id="json-file" type="file" accept=".json,application/json"><p class="hint">The single file saved by <code>--results</code>. Nothing is uploaded.</p></div>
+    </section>
+    <div id="messages" role="status" aria-live="polite" hidden></div>
+    <section class="viewer" aria-label="Video review">
+      <div class="viewer-top"><h2>Source-frame review</h2><span id="range-info">Load both files to select the recorded range</span></div>
+      <div id="stage" class="stage">
+        <video id="video" preload="auto" muted playsinline aria-label="Source video"></video><canvas id="overlay" aria-hidden="true"></canvas>
+        <div id="empty" class="empty"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M16 7 9 42M32 7l7 35M14 16h20M12 26h24M10 36h28" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg><strong>Load a video and its results</strong><small>Play the recorded range, step through frames, or jump to a detection.</small></div>
+        <span id="frame-badge" hidden></span>
+      </div>
+      <div class="transport">
+        <div class="buttons">
+          <button id="play" class="primary" disabled>▶ Play range</button>
+          <button id="prev-frame" title="Previous video frame (Left arrow)" disabled>← Frame</button><button id="next-frame" title="Next video frame (Right arrow)" disabled>Frame →</button>
+          <span class="separator"></span>
+          <button id="prev-result" title="Previous recorded result (Shift + Left)" disabled>‹ Result</button><button id="next-result" title="Next recorded result (Shift + Right)" disabled>Result ›</button>
+          <div class="settings"><label class="check"><input id="show-overlay" type="checkbox" checked>Overlay</label><label class="check"><input id="loop" type="checkbox">Loop</label><label>Speed <select id="speed" aria-label="Playback speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label></div>
+        </div>
+        <div class="timeline"><canvas id="marks" aria-hidden="true"></canvas><input id="scrubber" type="range" min="0" max="1" value="0" step="1" disabled aria-label="Video frame within selected range"></div>
+        <div class="time-row"><span id="current-time">— / —</span><label class="frame-jump">Frame <input id="frame-input" type="number" min="0" step="1" disabled aria-label="Jump to source frame"></label><span id="range-ends">Start — · End — (exclusive)</span></div>
+      </div>
+    </section>
+    <div class="review-grid">
+      <section class="panel" aria-labelledby="details-title"><div class="panel-title"><h2 id="details-title">Current frame</h2><span id="result-status" class="badge">No video loaded</span></div>
+        <dl><dt>Processing mode</dt><dd id="detail-mode">—</dd><dt>Processing time</dt><dd id="detail-processing">—</dd><dt>Result available at</dt><dd id="detail-available">—</dd><dt>Original result age</dt><dd id="detail-age">—</dd><dt>Confidence (uncalibrated)</dt><dd id="detail-confidence">—</dd><dt>Original result dimensions</dt><dd id="detail-size">—</dd></dl>
+        <p id="frame-note">Unprocessed frames are not counted as negative detections.</p><pre id="record-error" hidden></pre>
+        <div class="legend"><span><i class="dot left"></i>Left rail</span><span><i class="dot right"></i>Right rail</span><span><i class="dot fill"></i>Rail corridor / detection marker</span></div>
+      </section>
+      <section class="panel" aria-labelledby="records-title"><div class="panel-title"><h2 id="records-title">Recorded frames <span id="record-count"></span></h2><select id="filter" aria-label="Filter recorded results"><option value="all">All results</option><option value="tracks">With tracks</option><option value="errors">Errors</option></select></div>
+        <div class="table-wrap"><table><thead><tr><th scope="col">Frame / time</th><th scope="col">Mode</th><th scope="col">Tracks</th></tr></thead><tbody id="records"><tr><td colspan="3">No results loaded.</td></tr></tbody></table></div>
+        <div class="pagination"><button id="prev-page" disabled aria-label="Previous results page">←</button><span id="page-info">0 results</span><button id="next-page" disabled aria-label="Next results page">→</button></div>
+      </section>
+    </div>
+    <p class="footnote"><kbd>Space</kbd> play/pause · <kbd>←</kbd> / <kbd>→</kbd> one source frame · <kbd>Shift</kbd> + arrows next/previous result. Overlays appear only on recorded source frames, never on skipped frames. Frame stepping assumes the constant FPS stored in the JSON. Review shows detections retrospectively, not their live arrival time.</p>
+  </main>
+</body>
+</html>

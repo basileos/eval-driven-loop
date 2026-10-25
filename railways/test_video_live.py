@@ -121,13 +121,21 @@ class LivePlayerTests(unittest.TestCase):
         self.assertEqual(self.saved()['summary']['stop_reason'], 'user_quit')
         self.assertGreater(len(shown), 5)
 
-    def test_streaming_reports_tracking_and_search_separately(self):
+    def test_streaming_reacquires_without_cooldown_after_flow_failure(self):
         self.candidate_code(0.01)
         self.assertEqual(self.run_player('--end-time', '0.4', '--streaming'), 0)
         data = self.saved()
         self.assertIn('search', data['summary']['processing_modes'])
         self.assertTrue(all('streaming' in result for result in data['frames']))
-        self.assertLess(data['summary']['useful_update_frames'], data['summary']['processed_frames'])
+        # The uniform test video has no optical-flow features. Each failed
+        # propagation must trigger immediate search, not a cooldown reply.
+        self.assertGreater(len(data['frames']), 1)
+        self.assertEqual(data['summary']['useful_update_frames'], data['summary']['processed_frames'])
+        self.assertEqual(data['summary']['processing_modes'], {'search': len(data['frames'])})
+        self.assertNotIn('search_every', data['run']['streaming'])
+        for result in data['frames'][1:]:
+            self.assertEqual(result['streaming']['reason'], 'tracking_lost')
+            self.assertEqual(result['streaming']['detector_calls'], 1)
 
     def test_invalid_interval(self):
         self.candidate_code(0)

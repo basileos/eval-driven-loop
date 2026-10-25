@@ -16,10 +16,15 @@ from dataclasses import asdict, dataclass
 
 if __package__:
     from .evaluation_config import POOL_TIMEOUT_SECONDS, PROCESS_TIMEOUT_SECONDS
+    from . import claude_generation
 else:
     from evaluation_config import POOL_TIMEOUT_SECONDS, PROCESS_TIMEOUT_SECONDS
+    import claude_generation
 
 # Configuration
+LLM_PROVIDER = os.environ.get("RAILWAYS_LLM_PROVIDER", "codex").strip().lower()
+if LLM_PROVIDER not in {"codex", "claude"}:
+    raise ValueError("RAILWAYS_LLM_PROVIDER must be codex or claude.")
 MAX_ITERATIONS = 10
 TARGET_SCORE = 0.8
 MAX_FALSE_POSITIVE_RATE = float(os.environ.get("RAILWAYS_MAX_FALSE_POSITIVE_RATE", "0.10"))
@@ -35,7 +40,7 @@ CODEX_REASONING_EFFORT = os.environ.get(
     "RAILWAYS_CODEX_REASONING_EFFORT", "low"
 )
 ARCHITECT_MODEL = os.environ.get(
-    "RAILWAYS_ARCHITECT_MODEL", "gpt-5.6-sol"
+    "RAILWAYS_ARCHITECT_MODEL", "opus" if LLM_PROVIDER == "claude" else "gpt-5.6-sol"
 )
 ARCHITECT_REASONING_EFFORT = os.environ.get(
     "RAILWAYS_ARCHITECT_REASONING_EFFORT", "medium"
@@ -43,9 +48,12 @@ ARCHITECT_REASONING_EFFORT = os.environ.get(
 ARCHITECT_TIMEOUT = max(
     1, int(os.environ.get("RAILWAYS_ARCHITECT_TIMEOUT", "600"))
 )
-MAX_CANDIDATE_LINES = max(
-    50, int(os.environ.get("RAILWAYS_MAX_CANDIDATE_LINES", "1000"))
-)
+GENERATION_MODEL = (os.environ.get("RAILWAYS_CLAUDE_MODEL", "sonnet")
+                    if LLM_PROVIDER == "claude" else CODEX_MODEL)
+GENERATION_EFFORT = (os.environ.get("RAILWAYS_CLAUDE_REASONING_EFFORT", "medium")
+                     if LLM_PROVIDER == "claude" else CODEX_REASONING_EFFORT)
+GENERATION_TIMEOUT = (max(1, int(os.environ.get("RAILWAYS_CLAUDE_TIMEOUT", "600")))
+                      if LLM_PROVIDER == "claude" else CODEX_TIMEOUT)
 MAX_REPAIR_ATTEMPTS = max(0, int(os.environ.get("RAILWAYS_MAX_REPAIR_ATTEMPTS", "1")))
 MAX_STAGNANT_ITERATIONS = max(
     1, int(os.environ.get("RAILWAYS_MAX_STAGNANT_ITERATIONS", "3"))
@@ -58,6 +66,43 @@ PARETO_ARCHIVE_SIZE = max(
 )
 EVAL_TIMEOUT = PROCESS_TIMEOUT_SECONDS
 MAX_LOG_BYTES = 9000  # Preserve geometry diagnostics in the next prompt
+
+PROPOSAL_GUIDANCE = """COARSE PROPOSALS, NATIVE-RESOLUTION REFINEMENT:
+Optimize LSD and proposal generation using a downsampled grayscale image. Start
+with a 1280 x 720 bounding box; compare 1920 x 1080 if coarse proposals lose real
+railways. Preserve aspect ratio, never upscale smaller images, and keep the
+original grayscale/BGR arrays for evidence checks. Set LSD's internal scale
+explicitly to avoid accidental additional downsampling.
+Immediately map every segment endpoint p and q back to native coordinates:
+sx = W_native / W_small; sy = H_native / H_small;
+p *= [sx, sy]; q *= [sx, sy]. Use actual resized dimensions, not a hardcoded
+factor. Apply crop offsets too for ROI/tile proposals. Compute lengths, gauge,
+pair distances, and the 5%-diagonal size gate in native-image units after mapping.
+Run fit_section, sub-pixel profile fitting, rail-width/gauge checks, sleeper and
+texture verification, and final rail tracing/refinement on ORIGINAL pixels.
+Return native-coordinate polylines; do not merely upscale final coarse rails.
+Dominant track directions may survive coarse LSD even when thin rails disappear:
+measure recall/IoU/FPR, and use bounded native-resolution local proposals when
+needed for curves or weak evidence. Reducing 4K to these sizes reduces pixel count
+by 4x or 9x; it does NOT guarantee that LSD, or the whole detector, runs 4x-9x faster.
+Use measured timing feedback to optimize the actual bottleneck, not just LSD.
+"""
+
+TIMING_GUIDANCE = """TIMING CONTRACT:
+Measure stages with time.perf_counter() and publish per-call seconds as a dict
+on process_image.last_timings (not in the returned track list). Reset it on EVERY
+call and publish it on early returns too, preferably using try/finally. Forward
+timings from process_frame if that is where computation happens. Suggested keys:
+decode, preprocess, lsd, proposal_generation, profile_fitting, tracing, total.
+Accumulate profile_fitting across fit_section calls. These are inclusive spans
+and can overlap (tracing may call fitting); do not sum them as disjoint work.
+The evaluator independently measures process_image latency, including its image
+decode but excluding scoring/overlays. Compare mean, p50, p95, maximum and dataset
+wall time with the same worker count. Serial FPS is only 1 / mean call latency;
+parallel evaluation throughput is NOT live-video FPS. Stage values are diagnostic,
+candidate-reported measurements, not acceptance criteria. Preserve real detection
+and the strict IoU/FPR acceptance policy while reducing runtime.
+"""
 
 SYSTEM_PROMPT = """You are an expert Computer Vision engineer.
 Write Python code implementing strictly the function:
@@ -73,17 +118,17 @@ Rules:
 5. Return [] if the image cannot be loaded or no acceptable railway is detected. Never force a corridor merely because an image decoded successfully. Require railway evidence and reject unrelated parallel roads, field boundaries, and vegetation edges.
 6. Return ONLY runnable Python code inside ```python ... ``` fences.
 7. Do not include CLI handlers or an `if __name__ == "__main__"` block.
-8. Process images at their original pixel resolution. Never downsample before line, edge, texture, or rail detection: thin rails lose their evidence. Native-resolution overlapping tiles are allowed if coordinates are mapped back correctly and duplicate tracks are merged. Optimize runtime without reducing spatial resolution.
+8. Use downsampled grayscale for LSD/coarse proposals, then map segments back before native-resolution fitting and railway-evidence verification. Follow the coarse-to-fine policy below; preserve original inputs and native output coordinates.
 9. Keep process_image deterministic and independent across images; evaluation runs images concurrently in separate processes.
 10. Do not inspect the filesystem, run commands, edit files, or use tools. All required context is in the task payload.
-11. Respect the configured line cap in the task payload. Keep Python concise and simplify oversized code instead of extending it.
+11. Keep Python concise and maintainable; avoid duplication without sacrificing detection stages or correctness.
 12. This environment uses OpenCV 5. Normalize HoughLinesP output with `np.asarray(lines).reshape(-1, 4)`; do not assume the OpenCV 4-only `(N, 1, 4)` shape.
 13. Do not wrap process_image in `except Exception: return []` or another blanket error handler. Return [] for an explicit image-decode failure, but let unexpected programming errors raise so the evaluator can report them.
 14. The target rails can curve and may be partly occluded. A disruption branch must produce piecewise or curved polylines rather than reducing every track to one extended straight segment.
 15. Reject undersized detections: the shorter predicted rail and the overall corridor span must each be at least 5% of the full image diagonal. Tiny parallel fragments are clutter, not an acceptable railway.
-16. Bound runtime at native resolution: prune clutter fragments before pairwise matching, use spatial indexing or vectorized operations, and avoid rescanning the entire image for every segment pair. Never solve a timeout by downsampling.
+16. Bound runtime: prune clutter before pairwise matching, use spatial indexing or vectorized operations, and avoid rescanning the entire image for every segment pair. Downsampling is allowed for proposals, not final rail-evidence verification.
 17. Preserve meaningful per-track confidence metadata when available: optional "confidence" in [0, 1] and "confidence_method" identifying its calculation. This is an uncalibrated evidence score, not a probability of correctness. For "verified_patch_fraction_v1", use the number of final verification sections passing the railway-evidence check divided by the number checked. If changing the calculation, change the method name; omit confidence rather than inventing a constant score. Confidence is diagnostic only and does not change polygon-IoU scoring.
-"""
+""" + "\n" + PROPOSAL_GUIDANCE + "\n" + TIMING_GUIDANCE
 
 ARCHITECT_SYSTEM_PROMPT = """You are the architecture planner for an eval-driven computer-vision search.
 Do not write implementation code. Diagnose why the current detector plateaus and give concise, concrete implementation guidance for four deliberately different classical-OpenCV branches. Respect the supplied runtime and output contract. Focus on representation changes, not threshold tweaks. Return plain text under 900 words."""
@@ -130,13 +175,25 @@ class CandidateMetrics:
     false_positive_rate: float
     detected_positive_rate: float
     wall_seconds: float
+    mean_image_seconds: float | None = None
+    p50_image_seconds: float | None = None
+    p95_image_seconds: float | None = None
+    max_image_seconds: float | None = None
+    serial_fps_estimate: float | None = None
+    evaluation_fps: float | None = None
 
     def summary(self) -> str:
+        latency = (
+            f", mean={self.mean_image_seconds:.3f}s"
+            if self.mean_image_seconds is not None else ""
+        )
+        if self.p95_image_seconds is not None:
+            latency += f", p95={self.p95_image_seconds:.3f}s"
         return (
             f"IoU={self.dataset_iou:.6f}, posIoU={self.mean_positive_iou:.4f}, "
             f"coverage={self.positive_coverage:.4f}, "
             f"precision={self.polygon_precision:.4f}, "
-            f"FPR={self.false_positive_rate:.3f}"
+            f"FPR={self.false_positive_rate:.3f}, eval={self.wall_seconds:.2f}s{latency}"
         )
 
 
@@ -302,8 +359,8 @@ class ParetoArchive:
             return "Pareto archive is empty."
         lines = [
             "| Source | Strategy | Dataset IoU | Positive IoU | Coverage | "
-            "Precision | FPR |",
-            "|---|---|---:|---:|---:|---:|---:|",
+            "Precision | FPR | Eval s | Mean ms | P95 ms |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for record in sorted(
             self.records,
@@ -312,12 +369,14 @@ class ParetoArchive:
         ):
             source = "baseline" if record.iteration == 0 else str(record.iteration)
             metrics = record.metrics
+            mean_ms = f"{metrics.mean_image_seconds * 1000:.1f}" if metrics.mean_image_seconds is not None else "n/a"
+            p95_ms = f"{metrics.p95_image_seconds * 1000:.1f}" if metrics.p95_image_seconds is not None else "n/a"
             lines.append(
                 f"| {source} | {record.strategy} | {metrics.dataset_iou:.6f} | "
                 f"{metrics.mean_positive_iou:.4f} | "
                 f"{metrics.positive_coverage:.4f} | "
                 f"{metrics.polygon_precision:.4f} | "
-                f"{metrics.false_positive_rate:.3f} |"
+                f"{metrics.false_positive_rate:.3f} | {metrics.wall_seconds:.2f} | {mean_ms} | {p95_ms} |"
             )
         return "\n".join(lines)
 
@@ -532,8 +591,9 @@ class ContextManager:
             return (
                 "The last candidate exceeded the dataset runtime budget. Reduce "
                 "computational complexity, bound segment-pair searches and avoid "
-                "repeated full-image operations. Keep native resolution and genuine "
-                "railway detection; do not bypass evaluation by returning []."
+                "repeated full-image operations. Downsample LSD/coarse proposals, "
+                "map coordinates back, and keep fitting/verification at native resolution. "
+                "Use stage timings and genuine railway detection; do not bypass evaluation by returning []."
             )
         if "EMPTY DETECTOR" in feedback:
             return (
@@ -557,9 +617,11 @@ class ContextManager:
                 "with a materially different detection or geometry strategy."
             )
         return (
-            "Use the per-image diagnostics to make one concrete, measurable change "
-            "to railway discrimination, detection recall, or polygon localization "
-            "while respecting the false-positive acceptance gate."
+            "Prioritize measured runtime reduction through downsampled LSD/proposal "
+            "generation and coordinate rescaling before native-resolution fitting. "
+            "Instrument stage times and use the per-image diagnostics to preserve "
+            "railway discrimination, detection recall, and polygon localization "
+            "while respecting the IoU and false-positive acceptance gates."
         )
 
 
@@ -600,14 +662,14 @@ def terminate_process_group(process: subprocess.Popen, grace_seconds: float = 2.
 def call_codex_cli(
     prompt: str,
     system_prompt: str = "",
-    timeout: int = CODEX_TIMEOUT,
+    timeout: int = GENERATION_TIMEOUT,
     *,
-    model: str = CODEX_MODEL,
-    reasoning_effort: str = CODEX_REASONING_EFFORT,
+    model: str = GENERATION_MODEL,
+    reasoning_effort: str = GENERATION_EFFORT,
     diagnostic_montage: str | None = None,
     role: str = "implementer",
 ) -> str:
-    """Executes Codex CLI non-interactively in ephemeral mode."""
+    """Run the selected CLI. Historical name retained for callers/tests."""
     full_prompt = (
         f"System Instructions:\n{system_prompt}\n\nTask Payload:\n{prompt}"
     )
@@ -630,7 +692,7 @@ def call_codex_cli(
         "-",
     ]
 
-    with tempfile.TemporaryDirectory(prefix="railways-codex-") as generation_dir:
+    with tempfile.TemporaryDirectory(prefix=f"railways-{LLM_PROVIDER}-") as generation_dir:
         cmd[2:2] = ["--cd", generation_dir]
         reference_path = None
         if not diagnostic_montage:
@@ -644,22 +706,32 @@ def call_codex_cli(
                 cmd[-1:-1] = ["--image", entry["path"]]
                 full_prompt += f"Image {index}: {entry['label']}\n"
         image_bytes = sum(os.path.getsize(entry["path"]) for entry in context_images)
+        cli_input = full_prompt
+        if LLM_PROVIDER == "claude":
+            cmd, cli_input = claude_generation.request(full_prompt, context_images, model, reasoning_effort)
         print(
-            f"GENERATION: {role} model={model} reasoning={reasoning_effort} "
+            f"GENERATION: {role} provider={LLM_PROVIDER} model={model} reasoning={reasoning_effort} "
             f"timeout={timeout}s images={len(context_images)} "
             f"image_files={image_bytes / (1024 ** 2):.1f} MiB (native resolution)",
             flush=True,
         )
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=generation_dir,
-            start_new_session=True,
-        )
+        if LLM_PROVIDER == "claude":
+            print(f"CLAUDE TRANSPORT: {len(cli_input.encode('utf-8')) / (1024 ** 2):.1f} MiB; "
+                  "native dimensions, oversized images JPEG-encoded; provider may resize internally.", flush=True)
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=generation_dir,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise RuntimeError(f"Could not start {LLM_PROVIDER} CLI: {error}") from error
 
+        generation_started = time.perf_counter()
         try:
             message = (
                 f"Running {role} via {model}/{reasoning_effort} "
@@ -667,7 +739,7 @@ def call_codex_cli(
             )
             with Spinner(message):
                 stdout, stderr = process.communicate(
-                    input=full_prompt, timeout=timeout
+                    input=cli_input, timeout=timeout
                 )
         except subprocess.TimeoutExpired as error:
             terminate_process_group(process)
@@ -677,15 +749,24 @@ def call_codex_cli(
             if detail.strip():
                 print(f"Last CLI output before timeout:\n{detail[-2000:]}", file=sys.stderr)
             raise RuntimeError(
-                f"Codex CLI exceeded its {timeout}s limit; its process group was "
-                "stopped. Adjust RAILWAYS_CODEX_TIMEOUT (or "
+                f"{LLM_PROVIDER.title()} CLI exceeded its {timeout}s limit; its process group was "
+                f"stopped. Adjust RAILWAYS_{LLM_PROVIDER.upper()}_TIMEOUT (or "
                 "RAILWAYS_ARCHITECT_TIMEOUT for architecture calls) if needed."
             ) from error
         except KeyboardInterrupt:
             terminate_process_group(process)
             raise
+        finally:
+            print(f"GENERATION TIME: {role} wall_seconds={time.perf_counter() - generation_started:.3f}", flush=True)
 
         if process.returncode != 0:
+            if LLM_PROVIDER == "claude" and stdout.strip():
+                try:
+                    claude_generation.response(stdout)
+                except RuntimeError as error:
+                    # Claude often reports auth/API errors only in stdout's
+                    # result envelope, leaving stderr empty.
+                    stderr = stderr or str(error)
             raise subprocess.CalledProcessError(
                 process.returncode,
                 cmd,
@@ -693,7 +774,7 @@ def call_codex_cli(
                 stderr=stderr,
             )
 
-    return stdout.strip()
+    return claude_generation.response(stdout) if LLM_PROVIDER == "claude" else stdout.strip()
 
 
 def execute_evaluator(
@@ -755,6 +836,10 @@ def build_prompt_payload(
 Target Score: {TARGET_SCORE}
 Runtime budget: {POOL_TIMEOUT_SECONDS:g} seconds for the entire validation dataset, not per image.
 
+### SPEED OPTIMIZATION
+{PROPOSAL_GUIDANCE}
+{TIMING_GUIDANCE}
+
 ### FILE ACCEPTANCE CRITERIA
 {acceptance_guidance(retained_metrics)}
 
@@ -784,9 +869,9 @@ Review the scoreboard trend, current code, and diagnostic feedback.
 Follow REQUIRED NEXT MOVE while preserving evidence-based rejection of non-railway images.
 Implement the active search strategy materially; do not collapse it into another threshold-only variant of the current straight-line detector.
 Increase Dataset Polygon IoU toward {TARGET_SCORE} subject to FILE ACCEPTANCE CRITERIA. Use positive IoU, coverage, and precision as diagnostic feedback; false-positive rate is also a hard acceptance constraint.
-The attachments are separate native-resolution original frames and annotated copies, identified by the attachment index below. Ground truth uses red/blue rails with yellow fill; predictions use cyan/magenta rails with green fill. Inspect originals for rail evidence unobscured by overlays. Use coverage, precision, area ratio, and normalized centroid offset to correct geometry. Preserve full-resolution processing in the generated detector.
+The attachments are separate native-resolution original frames and annotated copies, identified by the attachment index below. Ground truth uses red/blue rails with yellow fill; predictions use cyan/magenta rails with green fill. Inspect originals for rail evidence unobscured by overlays. Use coverage, precision, area ratio, and normalized centroid offset to correct geometry. Use coarse proposals with native-resolution refinement in the generated detector.
 Do not inspect files or run tools. Respond immediately from the supplied code and feedback.
-Return at most {MAX_CANDIDATE_LINES} lines; simplify the implementation when necessary.
+Return complete, concise Python; preserve all necessary detection stages.
 Return ONLY full updated Python code inside ```python ``` fences."""
 
 
@@ -802,7 +887,7 @@ def parse_metrics(output: str) -> CandidateMetrics | None:
     values = {
         key: float(value)
         for key, value in re.findall(
-            r"([a-z_]+)=([0-9]+(?:\.[0-9]+)?)", match.group(1)
+            r"([a-z_][a-z0-9_]*)=([0-9]+(?:\.[0-9]+)?)", match.group(1)
         )
     }
     required = {
@@ -816,13 +901,15 @@ def parse_metrics(output: str) -> CandidateMetrics | None:
     }
     if not required.issubset(values):
         return None
-    return CandidateMetrics(**{key: values[key] for key in required})
+    optional = {"mean_image_seconds", "p50_image_seconds", "p95_image_seconds",
+                "max_image_seconds", "serial_fps_estimate", "evaluation_fps"}
+    return CandidateMetrics(**{key: values[key] for key in required | (optional & values.keys())})
 
 
 def print_evaluator_diagnostics(output: str) -> None:
     """Show the concise evaluator facts that explain a score."""
     for line in output.splitlines():
-        if line.startswith(("SUMMARY:", "METRICS:", "DIAGNOSIS:")):
+        if line.startswith(("SUMMARY:", "METRICS:", "TIMING:", "TIMING_STAGES:", "DIAGNOSIS:")):
             print(line)
 
 
@@ -949,23 +1036,23 @@ def evaluate_with_repairs(
     version_prefix = attempt_prefix
     for repair_index in range(MAX_REPAIR_ATTEMPTS + 1):
         write_artifact(version_prefix + ".py", code)
-        line_count = len(code.splitlines())
-        if line_count > MAX_CANDIDATE_LINES:
-            success, stdout, stderr = False, "", (
-                f"LINE_LIMIT: generated {line_count} lines; configured limit is {MAX_CANDIDATE_LINES}."
+        evaluation_started = time.perf_counter()
+        try:
+            success, stdout, stderr = evaluate_candidate_source(
+                code, candidate_path=version_prefix + ".py",
+                diagnostic_montage_path=version_prefix + ".json",
             )
-        else:
-            try:
-                success, stdout, stderr = evaluate_candidate_source(
-                    code, candidate_path=version_prefix + ".py",
-                    diagnostic_montage_path=version_prefix + ".json",
-                )
-            except SyntaxError as error:
-                success, stdout, stderr = False, "", "".join(
-                    traceback.format_exception_only(type(error), error)
-                ).strip()
+        except SyntaxError as error:
+            success, stdout, stderr = False, "", "".join(
+                traceback.format_exception_only(type(error), error)
+            ).strip()
         write_artifact(version_prefix + ".stdout.txt", stdout)
         write_artifact(version_prefix + ".stderr.txt", stderr)
+        write_artifact(version_prefix + ".timing.json", json.dumps({
+            "evaluation_attempt_wall_seconds": time.perf_counter() - evaluation_started,
+            "success": success,
+            "note": "Includes validation/subprocess/scoring/diagnostics; not per-image latency or generation.",
+        }, indent=2))
         result = AttemptEvaluation(code, success, stdout, stderr, version_prefix)
         if success or repair_index == MAX_REPAIR_ATTEMPTS:
             return result
@@ -979,13 +1066,16 @@ Architecture instructions: {strategy_instruction}
 
 Repair this failed implementation in place. Preserve its architecture and railway
 discrimination logic; do not restart from the baseline or substitute another branch.
-Correct the concrete failure below. For timeouts, reduce complexity without
-downsampling. For excessive length, simplify without dropping detection stages.
+Correct the concrete failure below. For timeouts, reduce complexity using coarse
+proposals and native-resolution refinement. Keep the implementation concise without dropping detection stages.
 Never hide errors with blanket exception handlers or unconditional empty output.
 Evaluation will rerun on the entire original-resolution validation dataset.
 Runtime budget: {POOL_TIMEOUT_SECONDS:g} seconds for the entire dataset.
-Return no more than {MAX_CANDIDATE_LINES} lines, including comments and blank lines.
+Return the complete repaired implementation without truncation.
 File acceptance criteria: {acceptance_guidance(retained_metrics)}
+
+{PROPOSAL_GUIDANCE}
+{TIMING_GUIDANCE}
 
 Failure from the current source:
 {error_log}
@@ -1000,8 +1090,8 @@ Return ONLY the complete repaired Python source inside ```python ``` fences.
         print(f"REPAIR {repair_index + 1}/{MAX_REPAIR_ATTEMPTS}: {strategy_name} (same iteration)")
         try:
             response = call_codex_cli(
-                repair_prompt, SYSTEM_PROMPT, model=CODEX_MODEL,
-                reasoning_effort=CODEX_REASONING_EFFORT,
+                repair_prompt, SYSTEM_PROMPT, model=GENERATION_MODEL,
+                reasoning_effort=GENERATION_EFFORT,
                 diagnostic_montage=parent_montage,
                 role=f"{strategy_name} repair {repair_index + 1}",
             )
@@ -1042,7 +1132,10 @@ Latest evaluator feedback:
 Required independent branches:
 {branch_list}
 
-For each branch, identify the representation change, core OpenCV operations, how to recover long curved/occluded rails, and how to control false positives and runtime. Process original-resolution pixels; never downsample railway evidence. Use the separate full-resolution original frames and prediction-vs-target overlays as evidence. Do not return code."""
+For each branch, identify the representation change, core OpenCV operations, how to recover long curved/occluded rails, and how to control false positives and runtime.
+{PROPOSAL_GUIDANCE}
+{TIMING_GUIDANCE}
+Use the separate full-resolution original frames and prediction-vs-target overlays as evidence. Do not return code."""
 
     try:
         guidance = call_codex_cli(
@@ -1088,7 +1181,7 @@ def run_orchestrator(task_description: str):
     with nullcontext(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S-"), dir=RUNS_DIR)) as search_dir:
         print(f"RUN ARTIFACTS: {search_dir}")
         print(f"EVALUATION BUDGET: dataset={POOL_TIMEOUT_SECONDS:g}s; process={EVAL_TIMEOUT:g}s")
-        print(f"CANDIDATE LIMITS: lines={MAX_CANDIDATE_LINES}; repair attempts={MAX_REPAIR_ATTEMPTS} per iteration")
+        print(f"REPAIR BUDGET: {MAX_REPAIR_ATTEMPTS} attempts per iteration")
         write_artifact(os.path.join(search_dir, "baseline.py"), best_code)
         if best_code:
             print("\n--- Baseline ---")
@@ -1117,6 +1210,7 @@ def run_orchestrator(task_description: str):
                 working_feedback = baseline_feedback
                 working_montage = best_record.diagnostic_montage
                 print(f"BASELINE: {baseline_metrics.summary()}")
+                print_evaluator_diagnostics(stdout)
                 if baseline_metrics.false_positive_rate > MAX_FALSE_POSITIVE_RATE:
                     print(
                         "BASELINE FAILS FPR GATE: preserving it until a replacement "
@@ -1238,14 +1332,14 @@ def run_orchestrator(task_description: str):
                 llm_output = call_codex_cli(
                     prompt_payload,
                     SYSTEM_PROMPT,
-                    model=CODEX_MODEL,
-                    reasoning_effort=CODEX_REASONING_EFFORT,
+                    model=GENERATION_MODEL,
+                    reasoning_effort=GENERATION_EFFORT,
                     diagnostic_montage=parent_montage,
                     role=f"{strategy_name} implementer",
                 )
             except subprocess.CalledProcessError as error:
                 write_artifact(attempt_prefix + ".generation_error.txt", str(error.stderr))
-                print(f"Codex CLI Execution Error:\n{error.stderr}")
+                print(f"{LLM_PROVIDER.title()} CLI Execution Error:\n{error.stderr}")
                 break
             except RuntimeError as error:
                 write_artifact(attempt_prefix + ".generation_error.txt", str(error))
@@ -1280,9 +1374,9 @@ def run_orchestrator(task_description: str):
                 print(f"FAILED: {'Evaluation timeout' if timed_out else 'Candidate evaluation error'}\n{err_log}")
                 working_feedback = (
                     f"Execution Failed with Error:\n{err_log}\n"
-                    + ("Reduce computational complexity at native resolution. Bound fragment counts "
+                    + ("Reduce computational complexity with downsampled proposals and native-resolution fitting. Bound fragment counts "
                        "before pairwise matching and avoid full-image operations inside segment loops. "
-                       "Do not downsample or replace detection with unconditional []."
+                       "Measure stage timings. Do not downsample final verification or replace detection with unconditional []."
                        if timed_out else "Fix the programming error before changing detection behavior.")
                 )
                 working_montage = None

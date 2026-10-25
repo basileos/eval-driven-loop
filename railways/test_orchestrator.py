@@ -356,10 +356,9 @@ class RepairTests(unittest.TestCase):
         self.prefix = str(self.root / "iteration_06_segment_graph_spline")
         self.source = "def process_image(path):\n    return undefined_name\n"
         self.fixed = "def process_image(path):\n    return []\n"
-        for name, value in (("MAX_REPAIR_ATTEMPTS", 1), ("MAX_CANDIDATE_LINES", 1000)):
-            setting = patch.object(loop, name, value)
-            setting.start()
-            self.addCleanup(setting.stop)
+        setting = patch.object(loop, "MAX_REPAIR_ATTEMPTS", 1)
+        setting.start()
+        self.addCleanup(setting.stop)
 
     def run_attempt(self, code=None):
         with redirect_stdout(io.StringIO()):
@@ -383,7 +382,7 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(evaluate.call_count, 2)
         self.assertEqual(generate.call_count, 1)
         prompt = generate.call_args.args[0]
-        for expected in (self.source, "m == src2.rows", "segment_graph_spline", "Fit splines", "FPR <= 0.100000", "Preserve its architecture", "1000 lines"):
+        for expected in (self.source, "m == src2.rows", "segment_graph_spline", "Fit splines", "FPR <= 0.100000", "Preserve its architecture"):
             self.assertIn(expected, prompt)
         self.assertEqual(generate.call_args.kwargs["model"], loop.CODEX_MODEL)
         self.assertEqual(generate.call_args.kwargs["diagnostic_montage"], "parent.json")
@@ -423,22 +422,36 @@ class RepairTests(unittest.TestCase):
         self.assertTrue(result.success)
         generate.assert_not_called()
 
-    def test_614_lines_reach_evaluation_and_custom_cap_requests_shorter_repair(self):
-        source = "# comment\n" * 612 + self.fixed
-        self.assertEqual(len(source.splitlines()), 614)
+    def test_long_source_reaches_evaluation_without_length_repair(self):
+        source = "# comment\n" * 10000 + self.fixed
         with (
-            patch.object(loop, "evaluate_candidate_source", return_value=evaluation(metrics())) as evaluate,
-            patch.object(loop, "call_codex_cli", return_value=self.fixed) as generate,
+            patch.object(loop, "execute_evaluator", return_value=evaluation(metrics())) as evaluate,
+            patch.object(loop, "call_codex_cli") as generate,
+            patch.dict(loop.os.environ, {"RAILWAYS_MAX_CANDIDATE_LINES": "50"}),
         ):
-            self.assertTrue(self.run_attempt(source).success)
+            result = self.run_attempt(source)
+            self.assertTrue(result.success)
+            self.assertEqual(result.code, source)
             self.assertEqual(evaluate.call_count, 1)
             generate.assert_not_called()
-            with patch.object(loop, "MAX_CANDIDATE_LINES", 50):
-                self.assertTrue(self.run_attempt(source).success)
-            self.assertEqual(evaluate.call_count, 2)  # Oversized source itself never executes.
-        self.assertIn("50 lines", generate.call_args.args[0])
-        self.assertNotIn("600 lines", loop.SYSTEM_PROMPT)
-        self.assertNotIn("1000 lines", loop.SYSTEM_PROMPT)  # No contradictory hardcoded cap.
+        self.assertEqual(Path(self.prefix + ".py").read_text(), source)
+        self.assertFalse(hasattr(loop, "MAX_CANDIDATE_LINES"))
+
+    def test_long_repair_is_evaluated_and_prompts_have_no_line_limit(self):
+        repaired = "# repaired stage\n" * 1200 + self.fixed
+        with (
+            patch.object(loop, "evaluate_candidate_source", side_effect=[
+                (False, "", "NameError: undefined_name"), evaluation(metrics()),
+            ]) as evaluate,
+            patch.object(loop, "call_codex_cli", return_value=repaired) as generate,
+        ):
+            result = self.run_attempt()
+        self.assertTrue(result.success)
+        self.assertEqual(result.code, repaired.strip())
+        self.assertEqual(evaluate.call_count, 2)
+        payload = loop.build_prompt_payload("", "", "", "", "", "", "", "", "test")
+        for prompt in (loop.SYSTEM_PROMPT, payload, generate.call_args.args[0]):
+            self.assertNotRegex(prompt, r"(?i)line (?:cap|limit)|(?:at most|no more than) .*lines|\d+ lines")
 
     def test_generation_failure_saved_and_propagated_without_retry(self):
         with (

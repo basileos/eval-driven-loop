@@ -59,7 +59,7 @@ def initialize_processor(candidate_path, output_directory, save_overlay, ignore_
 
 
 def detect_decoded_frame(frame, reference_shape=None):
-    """Only legacy detector invocations need a temporary file, not tracking frames."""
+    """Run the candidate detector on decoded pixels; path-only candidates get a temporary BMP."""
     if _process_frame is not None:
         if reference_shape is not None and _roi_reference_shape:
             return _process_frame(frame, reference_shape=reference_shape)
@@ -251,8 +251,6 @@ def add_streaming_arguments(parser, *, live_sources=True):
                         + (', latest-frame buffering for live sources' if live_sources else ''))
     parser.add_argument('--verify-every', type=positive_int, default=10,
                         help='streaming: revalidate tracked ROIs every N processed frames (default: 10)')
-    parser.add_argument('--search-every', type=positive_int, default=30,
-                        help='streaming: minimum processed-frame interval between full searches when lost (default: 30)')
     parser.add_argument('--full-search-every', type=positive_int, default=150,
                         help='streaming: full-frame refresh interval while tracking (default: 150 processed frames)')
     parser.add_argument('--roi-margin', type=positive_int, default=96,
@@ -334,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--start-time and --end-time require a local video file")
     streaming_options = None
     if args.streaming:
-        streaming_options = dict(verify_every=args.verify_every, search_every=args.search_every,
+        streaming_options = dict(verify_every=args.verify_every,
                                  full_search_every=args.full_search_every, roi_margin=args.roi_margin,
                                  max_gap_seconds=args.max_track_gap)
         if args.workers != 1:

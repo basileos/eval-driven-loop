@@ -63,7 +63,7 @@ def main(argv=None):
     video.load_candidate_functions(candidate)  # Fail before creating output files.
     streaming_options = None
     if args.streaming:
-        streaming_options = dict(verify_every=args.verify_every, search_every=args.search_every,
+        streaming_options = dict(verify_every=args.verify_every,
                                  full_search_every=args.full_search_every, roi_margin=args.roi_margin,
                                  max_gap_seconds=args.max_track_gap)
     capture = cv2.VideoCapture(str(source))
